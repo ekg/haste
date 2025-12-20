@@ -25,6 +25,8 @@
 //     H = hidden size
 // and the rightmost dimension changes the fastest.
 
+#include "haste/elman.h"
+#include "haste/elman_silu.h"
 #include "haste/gru.h"
 #include "haste/indrnn.h"
 #include "haste/layer_norm.h"

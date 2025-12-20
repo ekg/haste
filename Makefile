@@ -19,7 +19,7 @@ endif
 
 LOCAL_CFLAGS := -I/usr/include/eigen3 -I$(CUDA_HOME)/include -Ilib -O3
 LOCAL_LDFLAGS := -L$(CUDA_HOME)/lib64 -L. -lcudart -lcublas
-GPU_ARCH_FLAGS := -gencode arch=compute_37,code=compute_37 -gencode arch=compute_60,code=compute_60 -gencode arch=compute_70,code=compute_70
+GPU_ARCH_FLAGS := -gencode arch=compute_80,code=sm_80 -gencode arch=compute_89,code=sm_89
 
 # Small enough project that we can just recompile all the time.
 .PHONY: all haste haste_tf haste_pytorch libhaste_tf examples benchmarks clean
@@ -27,6 +27,10 @@ GPU_ARCH_FLAGS := -gencode arch=compute_37,code=compute_37 -gencode arch=compute
 all: haste haste_tf haste_pytorch examples benchmarks
 
 haste:
+	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_forward_gpu.cu.cc -o lib/elman_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
+	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_backward_gpu.cu.cc -o lib/elman_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
+	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_silu_forward_gpu.cu.cc -o lib/elman_silu_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
+	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_silu_backward_gpu.cu.cc -o lib/elman_silu_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/lstm_forward_gpu.cu.cc -o lib/lstm_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/lstm_backward_gpu.cu.cc -o lib/lstm_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/gru_forward_gpu.cu.cc -o lib/gru_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
