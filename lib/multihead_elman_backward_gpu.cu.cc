@@ -1,15 +1,7 @@
 // Copyright 2024 Erik Garrison. Apache 2.0 License.
 // Multi-head Elman RNN backward pass.
 //
-// Backward through: h_new = activation(R @ h + Wx @ x + b)
-//
-// Gradient computation:
-//   dpre = dh_new * d_activation(pre)
-//   dR += dpre @ h.T  (per head, accumulated)
-//   dWx += dpre @ x.T  (per head, accumulated)
-//   db += dpre  (per head, accumulated)
-//   dh = R.T @ dpre  (for previous timestep)
-//   dx = Wx.T @ dpre
+// Uses cublasSgemmStridedBatched to process all heads in single kernel calls.
 
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
@@ -67,32 +59,28 @@ __nv_bfloat16 d_tanh_residual(const __nv_bfloat16 pre) {
 }
 #endif
 
-// Fused kernel: Compute dpre = (dy + dh) * d_activation(pre)
-// This combines the gradient from output (dy) and hidden state (dh_from_next)
+// Fused kernel: dpre = (dy + dh) * d_activation(pre)
 template<typename T, int Activation>
 __global__
 void FusedActivationBackwardKernel(
     const int size,
-    const T* __restrict__ dy,       // [B, nheads, headdim]
-    const T* __restrict__ dh,       // [B, nheads, headdim] - gradient from next timestep
-    const T* __restrict__ pre_act,  // [B, nheads, headdim]
-    T* __restrict__ dpre            // [B, nheads, headdim]
+    const T* __restrict__ dy,
+    const T* __restrict__ dh,
+    const T* __restrict__ pre_act,
+    T* __restrict__ dpre
 ) {
     const int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= size) return;
 
     const T pre = pre_act[idx];
-    const T dh_total = dy[idx] + dh[idx];  // Combine gradients
+    const T dh_total = dy[idx] + dh[idx];
     T d_act;
 
     if (Activation == 0) {
-        // Softsign
         d_act = d_softsign(pre);
     } else if (Activation == 1) {
-        // Tanh residual
         d_act = d_tanh_residual(pre);
     } else {
-        // Tanh
         const T tanh_pre = tanh(pre);
         d_act = static_cast<T>(1.0) - tanh_pre * tanh_pre;
     }
@@ -100,15 +88,15 @@ void FusedActivationBackwardKernel(
     dpre[idx] = dh_total * d_act;
 }
 
-// Kernel: Accumulate bias gradient (sum over batch dimension)
+// Kernel: Accumulate bias gradient
 template<typename T>
 __global__
 void AccumulateBiasGradKernel(
     const int batch_size,
     const int nheads,
     const int headdim,
-    const T* __restrict__ dpre,  // [B, nheads, headdim]
-    T* __restrict__ db           // [nheads, headdim]
+    const T* __restrict__ dpre,
+    T* __restrict__ db
 ) {
     const int idx = blockDim.x * blockIdx.x + threadIdx.x;
     const int total = nheads * headdim;
@@ -120,8 +108,69 @@ void AccumulateBiasGradKernel(
         sum += dpre[b * total + idx];
     }
 
-    // Atomic add for accumulation across timesteps
     atomicAdd(&db[idx], sum);
+}
+
+// Strided batched GEMM wrappers
+inline cublasStatus_t stridedBatchedGemm(
+    cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const float* alpha,
+    const float* A, int lda, long long strideA,
+    const float* B, int ldb, long long strideB,
+    const float* beta,
+    float* C, int ldc, long long strideC,
+    int batchCount) {
+    return cublasSgemmStridedBatched(handle, transa, transb, m, n, k,
+        alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC, batchCount);
+}
+
+inline cublasStatus_t stridedBatchedGemm(
+    cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const double* alpha,
+    const double* A, int lda, long long strideA,
+    const double* B, int ldb, long long strideB,
+    const double* beta,
+    double* C, int ldc, long long strideC,
+    int batchCount) {
+    return cublasDgemmStridedBatched(handle, transa, transb, m, n, k,
+        alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC, batchCount);
+}
+
+inline cublasStatus_t stridedBatchedGemm(
+    cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const __half* alpha,
+    const __half* A, int lda, long long strideA,
+    const __half* B, int ldb, long long strideB,
+    const __half* beta,
+    __half* C, int ldc, long long strideC,
+    int batchCount) {
+    return cublasHgemmStridedBatched(handle, transa, transb, m, n, k,
+        alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC, batchCount);
+}
+
+inline cublasStatus_t stridedBatchedGemm(
+    cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const __nv_bfloat16* alpha,
+    const __nv_bfloat16* A, int lda, long long strideA,
+    const __nv_bfloat16* B, int ldb, long long strideB,
+    const __nv_bfloat16* beta,
+    __nv_bfloat16* C, int ldc, long long strideC,
+    int batchCount) {
+    float alpha_f = __bfloat162float(*alpha);
+    float beta_f = __bfloat162float(*beta);
+    return cublasGemmStridedBatchedEx(handle, transa, transb, m, n, k,
+        &alpha_f, A, CUDA_R_16BF, lda, strideA,
+        B, CUDA_R_16BF, ldb, strideB,
+        &beta_f, C, CUDA_R_16BF, ldc, strideC,
+        batchCount, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
 }  // anonymous namespace
@@ -164,22 +213,22 @@ BackwardPass<T>::~BackwardPass() {
 template<typename T>
 void BackwardPass<T>::Run(
     const int steps,
-    const T* R,         // [nheads, headdim, headdim]
-    const T* Wx,        // [nheads, headdim, headdim]
-    const T* x,         // [T, B, nheads, headdim]
-    const T* h,         // [T+1, B, nheads, headdim] - h[0] is initial state
-    const T* pre_act,   // [T, B, nheads, headdim]
-    const T* dy,        // [T, B, nheads, headdim]
-    T* dx,              // [T, B, nheads, headdim]
-    T* dR,              // [nheads, headdim, headdim]
-    T* dWx,             // [nheads, headdim, headdim]
-    T* db,              // [nheads, headdim]
-    T* dh0,             // [B, nheads, headdim]
-    T* tmp_dpre,        // [B, nheads, headdim]
-    T* tmp_dh           // [B, nheads, headdim]
+    const T* R,
+    const T* Wx,
+    const T* x,
+    const T* h,
+    const T* pre_act,
+    const T* dy,
+    T* dx,
+    T* dR,
+    T* dWx,
+    T* db,
+    T* dh0,
+    T* tmp_dpre,
+    T* tmp_dh
 ) {
     static const T alpha = static_cast<T>(1.0);
-    static const T beta = static_cast<T>(0.0);
+    static const T beta_zero = static_cast<T>(0.0);
     static const T beta_one = static_cast<T>(1.0);
 
     const blas<void>::set_pointer_mode scoped1(data_->blas_handle);
@@ -195,23 +244,24 @@ void BackwardPass<T>::Run(
 
     const int BNH = batch_size * nheads * headdim;
     const int NH = nheads * headdim;
+    const long long strideW = headdim * headdim;
+    const long long strideH = headdim;
 
-    // Initialize dh to zeros (will accumulate gradient from future timesteps)
+    // Initialize dh to zeros
     cudaMemsetAsync(tmp_dh, 0, BNH * sizeof(T), stream);
 
-    // Process timesteps in reverse order
+    // Process timesteps in reverse
     for (int t = steps - 1; t >= 0; --t) {
         const T* dy_t = dy + t * BNH;
         const T* pre_act_t = pre_act + t * BNH;
         const T* x_t = x + t * BNH;
-        const T* h_t = h + t * BNH;  // h[t] is the state BEFORE timestep t
+        const T* h_t = h + t * BNH;
         T* dx_t = dx + t * BNH;
 
-        // Step 1: Compute dpre = (dy + dh_from_next) * d_activation(pre)
+        // Step 1: dpre = (dy + dh_from_next) * d_activation(pre)
         const int threads = 256;
         const int blocks = (BNH + threads - 1) / threads;
 
-        // Fused kernel: dpre = (dy + dh_from_next) * d_activation(pre)
         if (activation == 0) {
             FusedActivationBackwardKernel<T, 0><<<blocks, threads, 0, stream>>>(
                 BNH, dy_t, tmp_dh, pre_act_t, tmp_dpre);
@@ -223,81 +273,67 @@ void BackwardPass<T>::Run(
                 BNH, dy_t, tmp_dh, pre_act_t, tmp_dpre);
         }
 
-        // Step 2: Accumulate gradients for R, Wx, b
+        // Step 2: Accumulate dR and dWx using batched GEMM
+        // dR[n] += dpre[n].T @ h[n] for each head n
+        // Shape: [headdim, B] @ [B, headdim] = [headdim, headdim]
+        // In cuBLAS: [headdim, headdim] = [headdim, B] @ [B, headdim].T
+        //         = dpre[n] @ h[n].T with CUBLAS_OP_N, CUBLAS_OP_T
 
-        // For each head: dR[head] += dpre[head] @ h[head].T
-        // dWx[head] += dpre[head] @ x[head].T
-        for (int head = 0; head < nheads; ++head) {
-            const T* dpre_head = tmp_dpre + head * headdim;
-            const T* h_head = h_t + head * headdim;
-            const T* x_head = x_t + head * headdim;
-            T* dR_head = dR + head * headdim * headdim;
-            T* dWx_head = dWx + head * headdim * headdim;
+        stridedBatchedGemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            headdim, headdim, batch_size,  // M, N, K
+            &alpha,
+            tmp_dpre, NH, strideH,         // dpre, lda, strideA
+            h_t, NH, strideH,              // h, ldb, strideB
+            &beta_one,                     // Accumulate!
+            dR, headdim, strideW,          // dR, ldc, strideC
+            nheads);
 
-            // dR[head] += dpre[batch, head, :].T @ h[batch, head, :]
-            // This is: headdim x B @ B x headdim = headdim x headdim
-            // Using: dpre as [B, headdim] with stride NH, h as [B, headdim] with stride NH
-            blas<T>::gemm(blas_handle,
-                CUBLAS_OP_N, CUBLAS_OP_T,
-                headdim, headdim, batch_size,
-                &alpha,
-                dpre_head, NH,  // [B, headdim] with stride NH
-                h_head, NH,
-                &beta_one,  // Accumulate
-                dR_head, headdim);
+        // dWx[n] += dpre[n].T @ x[n]
+        stridedBatchedGemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            headdim, headdim, batch_size,
+            &alpha,
+            tmp_dpre, NH, strideH,
+            x_t, NH, strideH,
+            &beta_one,
+            dWx, headdim, strideW,
+            nheads);
 
-            // dWx[head] += dpre.T @ x
-            blas<T>::gemm(blas_handle,
-                CUBLAS_OP_N, CUBLAS_OP_T,
-                headdim, headdim, batch_size,
-                &alpha,
-                dpre_head, NH,
-                x_head, NH,
-                &beta_one,
-                dWx_head, headdim);
-        }
-
-        // Accumulate bias gradient
+        // Accumulate db
         AccumulateBiasGradKernel<T><<<(NH + 255) / 256, 256, 0, stream>>>(
             batch_size, nheads, headdim, tmp_dpre, db);
 
-        // Step 3: Compute gradients for previous timestep
-        // dx[t] = Wx.T @ dpre
-        // dh[t-1] = R.T @ dpre
+        // Step 3: Compute dx and dh for previous timestep
+        // dx[t] = Wx.T @ dpre (batched)
+        // dh = R.T @ dpre (batched)
 
-        // Clear tmp_dh for accumulating dh
         cudaMemsetAsync(tmp_dh, 0, BNH * sizeof(T), stream);
 
-        for (int head = 0; head < nheads; ++head) {
-            const T* dpre_head = tmp_dpre + head * headdim;
-            const T* R_head = R + head * headdim * headdim;
-            const T* Wx_head = Wx + head * headdim * headdim;
-            T* dx_head = dx_t + head * headdim;
-            T* dh_head = tmp_dh + head * headdim;
+        // dx = Wx.T @ dpre
+        stridedBatchedGemm(blas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            headdim, batch_size, headdim,  // M, N, K
+            &alpha,
+            Wx, headdim, strideW,          // Wx.T
+            tmp_dpre, NH, strideH,
+            &beta_zero,
+            dx_t, NH, strideH,
+            nheads);
 
-            // dx[t, head] = Wx.T @ dpre
-            blas<T>::gemm(blas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                headdim, batch_size, headdim,
-                &alpha,
-                Wx_head, headdim,
-                dpre_head, NH,
-                &beta,
-                dx_head, NH);
-
-            // dh = R.T @ dpre (for next iteration, going backwards)
-            blas<T>::gemm(blas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                headdim, batch_size, headdim,
-                &alpha,
-                R_head, headdim,
-                dpre_head, NH,
-                &beta_one,  // Accumulate across heads (though they're independent)
-                dh_head, NH);
-        }
+        // dh = R.T @ dpre
+        stridedBatchedGemm(blas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            headdim, batch_size, headdim,
+            &alpha,
+            R, headdim, strideW,           // R.T
+            tmp_dpre, NH, strideH,
+            &beta_zero,
+            tmp_dh, NH, strideH,
+            nheads);
     }
 
-    // Copy final dh to dh0 (gradient w.r.t. initial hidden state)
+    // Copy final dh to dh0
     cudaMemcpyAsync(dh0, tmp_dh, BNH * sizeof(T), cudaMemcpyDeviceToDevice, stream);
 }
 

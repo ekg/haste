@@ -22,6 +22,10 @@ frameworks/pytorch/layer_norm_lstm.cc
 frameworks/pytorch/layer_norm_lstm.py
 frameworks/pytorch/lstm.cc
 frameworks/pytorch/lstm.py
+frameworks/pytorch/multihead_elman.cc
+frameworks/pytorch/multihead_elman.py
+frameworks/pytorch/skip_elman.cc
+frameworks/pytorch/skip_elman.py
 frameworks/pytorch/support.cc
 haste_pytorch.egg-info/PKG-INFO
 haste_pytorch.egg-info/SOURCES.txt
