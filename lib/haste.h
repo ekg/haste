@@ -27,6 +27,7 @@
 
 #include "haste/elman.h"
 #include "haste/elman_silu.h"
+#include "haste/elman_variants.h"
 #include "haste/gru.h"
 #include "haste/indrnn.h"
 #include "haste/layer_norm.h"

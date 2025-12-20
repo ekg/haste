@@ -31,6 +31,7 @@ haste:
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_backward_gpu.cu.cc -o lib/elman_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_silu_forward_gpu.cu.cc -o lib/elman_silu_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_silu_backward_gpu.cu.cc -o lib/elman_silu_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
+	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_variants_gpu.cu.cc -o lib/elman_variants_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/lstm_forward_gpu.cu.cc -o lib/lstm_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/lstm_backward_gpu.cu.cc -o lib/lstm_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/gru_forward_gpu.cu.cc -o lib/gru_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)

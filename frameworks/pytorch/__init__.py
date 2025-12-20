@@ -22,6 +22,7 @@ import torch as _
 from ._version import __version__  # generated in setup.py
 from .elman import Elman
 from .elman_silu import ElmanSilu
+from .elman_variants import ElmanTanh, ElmanSigmoid, ElmanSwish, ElmanGelu, ElmanNoGate
 from .gru import GRU
 from .indrnn import IndRNN
 from .lstm import LSTM
@@ -32,6 +33,11 @@ from .layer_norm_lstm import LayerNormLSTM
 __all__ = [
     'Elman',
     'ElmanSilu',
+    'ElmanTanh',
+    'ElmanSigmoid',
+    'ElmanSwish',
+    'ElmanGelu',
+    'ElmanNoGate',
     'GRU',
     'IndRNN',
     'LSTM',
