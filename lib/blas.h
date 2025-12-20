@@ -59,3 +59,34 @@ template<>
 struct blas<double> {
   static constexpr decltype(cublasDgemm)* gemm = &cublasDgemm;
 };
+
+// BF16 wrapper using cublasGemmEx (no direct cublasBgemm exists)
+#include <cuda_bf16.h>
+
+inline cublasStatus_t cublasBf16Gemm(
+    cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const __nv_bfloat16* alpha,
+    const __nv_bfloat16* A, int lda,
+    const __nv_bfloat16* B, int ldb,
+    const __nv_bfloat16* beta,
+    __nv_bfloat16* C, int ldc) {
+  // Convert alpha/beta to float for compute
+  float alpha_f = __bfloat162float(*alpha);
+  float beta_f = __bfloat162float(*beta);
+  return cublasGemmEx(
+      handle, transa, transb, m, n, k,
+      &alpha_f,
+      A, CUDA_R_16BF, lda,
+      B, CUDA_R_16BF, ldb,
+      &beta_f,
+      C, CUDA_R_16BF, ldc,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT);
+}
+
+template<>
+struct blas<__nv_bfloat16> {
+  static constexpr decltype(cublasBf16Gemm)* gemm = &cublasBf16Gemm;
+};

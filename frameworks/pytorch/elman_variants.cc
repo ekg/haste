@@ -55,7 +55,7 @@ std::vector<Tensor> elman_tanh_forward(
 
     h[0] = h0;
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_tanh_forward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_tanh_forward", ([&] {
         ElmanTanhForward<typename native_type<scalar_t>::T> forward(
             training,
             batch_size,
@@ -105,7 +105,7 @@ std::vector<Tensor> elman_tanh_backward(
     Tensor dh0 = torch::zeros({ batch_size, D }, options);
     Tensor tmp_dRh = torch::empty({ batch_size, gate_dim }, options);
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_tanh_backward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_tanh_backward", ([&] {
         ElmanTanhBackward<typename native_type<scalar_t>::T> backward(
             batch_size,
             D,
@@ -176,7 +176,7 @@ std::vector<Tensor> elman_sigmoid_forward(
 
     h[0] = h0;
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_sigmoid_forward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_sigmoid_forward", ([&] {
         ElmanSigmoidForward<typename native_type<scalar_t>::T> forward(
             training,
             batch_size,
@@ -226,7 +226,7 @@ std::vector<Tensor> elman_sigmoid_backward(
     Tensor dh0 = torch::zeros({ batch_size, D }, options);
     Tensor tmp_dRh = torch::empty({ batch_size, gate_dim }, options);
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_sigmoid_backward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_sigmoid_backward", ([&] {
         ElmanSigmoidBackward<typename native_type<scalar_t>::T> backward(
             batch_size,
             D,
@@ -297,7 +297,7 @@ std::vector<Tensor> elman_swish_forward(
 
     h[0] = h0;
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_swish_forward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_swish_forward", ([&] {
         ElmanSwishForward<typename native_type<scalar_t>::T> forward(
             training,
             batch_size,
@@ -347,7 +347,7 @@ std::vector<Tensor> elman_swish_backward(
     Tensor dh0 = torch::zeros({ batch_size, D }, options);
     Tensor tmp_dRh = torch::empty({ batch_size, gate_dim }, options);
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_swish_backward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_swish_backward", ([&] {
         ElmanSwishBackward<typename native_type<scalar_t>::T> backward(
             batch_size,
             D,
@@ -418,7 +418,7 @@ std::vector<Tensor> elman_gelu_forward(
 
     h[0] = h0;
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_gelu_forward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_gelu_forward", ([&] {
         ElmanGeluForward<typename native_type<scalar_t>::T> forward(
             training,
             batch_size,
@@ -468,7 +468,7 @@ std::vector<Tensor> elman_gelu_backward(
     Tensor dh0 = torch::zeros({ batch_size, D }, options);
     Tensor tmp_dRh = torch::empty({ batch_size, gate_dim }, options);
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_gelu_backward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_gelu_backward", ([&] {
         ElmanGeluBackward<typename native_type<scalar_t>::T> backward(
             batch_size,
             D,
@@ -538,7 +538,7 @@ std::vector<Tensor> elman_nogate_forward(
 
     h[0] = h0;
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_nogate_forward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_nogate_forward", ([&] {
         ElmanNoGateForward<typename native_type<scalar_t>::T> forward(
             training,
             batch_size,
@@ -587,7 +587,7 @@ std::vector<Tensor> elman_nogate_backward(
     Tensor dh0 = torch::zeros({ batch_size, D }, options);
     Tensor tmp_dRh = torch::empty({ batch_size, D }, options);
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_nogate_backward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_nogate_backward", ([&] {
         ElmanNoGateBackward<typename native_type<scalar_t>::T> backward(
             batch_size,
             D,

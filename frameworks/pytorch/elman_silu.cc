@@ -56,7 +56,7 @@ std::vector<Tensor> elman_silu_forward(
     // Initialize h[0] with h0
     h[0] = h0;
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_silu_forward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_silu_forward", ([&] {
         ForwardPass<typename native_type<scalar_t>::T> forward(
             training,
             batch_size,
@@ -109,7 +109,7 @@ std::vector<Tensor> elman_silu_backward(
     // Workspace
     Tensor tmp_dRh = torch::empty({ batch_size, gate_dim }, options);
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "elman_silu_backward", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "elman_silu_backward", ([&] {
         BackwardPass<typename native_type<scalar_t>::T> backward(
             batch_size,
             D,  // input_size

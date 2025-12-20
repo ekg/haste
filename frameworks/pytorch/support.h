@@ -16,6 +16,7 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <cuda_bf16.h>
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.options().device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -29,6 +30,11 @@ struct native_type {
 template<>
 struct native_type<c10::Half> {
   using T = __half;
+};
+
+template<>
+struct native_type<c10::BFloat16> {
+  using T = __nv_bfloat16;
 };
 
 template<typename U>

@@ -21,6 +21,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
+#include <cuda_bf16.h>
 
 #include "blas.h"
 #include "haste.h"
@@ -715,9 +716,11 @@ void BackwardPass<T>::Run(
 template struct ForwardPass<float>;
 template struct ForwardPass<double>;
 template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
 template struct BackwardPass<float>;
 template struct BackwardPass<double>;
 template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
 
 }  // namespace elman_tanh
 
@@ -913,9 +916,11 @@ void BackwardPass<T>::Run(
 template struct ForwardPass<float>;
 template struct ForwardPass<double>;
 template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
 template struct BackwardPass<float>;
 template struct BackwardPass<double>;
 template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
 
 }  // namespace elman_sigmoid
 
@@ -1111,9 +1116,11 @@ void BackwardPass<T>::Run(
 template struct ForwardPass<float>;
 template struct ForwardPass<double>;
 template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
 template struct BackwardPass<float>;
 template struct BackwardPass<double>;
 template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
 
 }  // namespace elman_swish
 
@@ -1309,9 +1316,11 @@ void BackwardPass<T>::Run(
 template struct ForwardPass<float>;
 template struct ForwardPass<double>;
 template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
 template struct BackwardPass<float>;
 template struct BackwardPass<double>;
 template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
 
 }  // namespace elman_gelu
 
@@ -1509,9 +1518,11 @@ void BackwardPass<T>::Run(
 template struct ForwardPass<float>;
 template struct ForwardPass<double>;
 template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
 template struct BackwardPass<float>;
 template struct BackwardPass<double>;
 template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
 
 }  // namespace elman_nogate
 

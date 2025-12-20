@@ -16,6 +16,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
+#include <cuda_bf16.h>
 
 #include "blas.h"
 #include "haste.h"
@@ -243,6 +244,7 @@ void BackwardPass<T>::Run(
 template struct BackwardPass<float>;
 template struct BackwardPass<double>;
 template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
 
 }  // namespace elman_silu
 }  // namespace v0

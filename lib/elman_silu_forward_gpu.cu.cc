@@ -413,6 +413,7 @@ void ForwardPass<T>::Run(
 template struct ForwardPass<float>;
 template struct ForwardPass<double>;
 template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
 
 }  // namespace elman_silu
 }  // namespace v0

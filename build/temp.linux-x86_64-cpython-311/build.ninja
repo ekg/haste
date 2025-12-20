@@ -1,0 +1,38 @@
+ninja_required_version = 1.3
+cxx = /home/erikg/micromamba/envs/mingru/bin/x86_64-conda-linux-gnu-c++
+
+cflags = -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/erikg/micromamba/envs/mingru/include -DNDEBUG -D_FORTIFY_SOURCE=2 -O2 -isystem /home/erikg/micromamba/envs/mingru/include -fPIC -I/home/erikg/haste_src/lib -I/usr/local/cuda/include -I/home/erikg/micromamba/envs/mingru/lib/python3.11/site-packages/torch/include -I/home/erikg/micromamba/envs/mingru/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda-12.8/include -I/home/erikg/micromamba/envs/mingru/include/python3.11 -c
+post_cflags = -Wno-sign-compare -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=haste_pytorch_lib -std=c++17
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+
+
+
+
+
+
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman.o: compile /home/erikg/haste_src/frameworks/pytorch/elman.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_silu.o: compile /home/erikg/haste_src/frameworks/pytorch/elman_silu.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_variants.o: compile /home/erikg/haste_src/frameworks/pytorch/elman_variants.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/gru.o: compile /home/erikg/haste_src/frameworks/pytorch/gru.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/indrnn.o: compile /home/erikg/haste_src/frameworks/pytorch/indrnn.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_gru.o: compile /home/erikg/haste_src/frameworks/pytorch/layer_norm_gru.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_indrnn.o: compile /home/erikg/haste_src/frameworks/pytorch/layer_norm_indrnn.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_lstm.o: compile /home/erikg/haste_src/frameworks/pytorch/layer_norm_lstm.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/lstm.o: compile /home/erikg/haste_src/frameworks/pytorch/lstm.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/support.o: compile /home/erikg/haste_src/frameworks/pytorch/support.cc
+
+
+
+
+
+
+
+
