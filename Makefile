@@ -48,6 +48,8 @@ haste:
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/indrnn_forward_gpu.cu.cc -o lib/indrnn_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_indrnn_forward_gpu.cu.cc -o lib/layer_norm_indrnn_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_indrnn_backward_gpu.cu.cc -o lib/layer_norm_indrnn_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
+	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/multihead_elman_forward_gpu.cu.cc -o lib/multihead_elman_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
+	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/multihead_elman_backward_gpu.cu.cc -o lib/multihead_elman_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(AR) $(AR_FLAGS) lib/*.o
 
 libhaste_tf: haste

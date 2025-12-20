@@ -25,6 +25,7 @@ void lstm_init(py::module&);
 void layer_norm_gru_init(py::module&);
 void layer_norm_indrnn_init(py::module&);
 void layer_norm_lstm_init(py::module&);
+void multihead_elman_init(py::module&);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   elman_init(m);
@@ -37,4 +38,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   layer_norm_gru_init(m);
   layer_norm_indrnn_init(m);
   layer_norm_lstm_init(m);
+  multihead_elman_init(m);
 }

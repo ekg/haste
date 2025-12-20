@@ -30,6 +30,7 @@ from .lstm import LSTM
 from .layer_norm_gru import LayerNormGRU
 from .layer_norm_indrnn import LayerNormIndRNN
 from .layer_norm_lstm import LayerNormLSTM
+from .multihead_elman import MultiHeadElman
 
 __all__ = [
     'Elman',
@@ -45,5 +46,6 @@ __all__ = [
     'LSTM',
     'LayerNormGRU',
     'LayerNormIndRNN',
-    'LayerNormLSTM'
+    'LayerNormLSTM',
+    'MultiHeadElman'
 ]
