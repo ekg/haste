@@ -36,6 +36,8 @@ haste:
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/lstm_backward_gpu.cu.cc -o lib/lstm_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/gru_forward_gpu.cu.cc -o lib/gru_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/gru_backward_gpu.cu.cc -o lib/gru_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
+	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/skip_elman_forward_gpu.cu.cc -o lib/skip_elman_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
+	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/skip_elman_backward_gpu.cu.cc -o lib/skip_elman_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_forward_gpu.cu.cc -o lib/layer_norm_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_backward_gpu.cu.cc -o lib/layer_norm_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
 	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_lstm_forward_gpu.cu.cc -o lib/layer_norm_lstm_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)

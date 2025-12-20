@@ -24,6 +24,7 @@ from .elman import Elman
 from .elman_silu import ElmanSilu
 from .elman_variants import ElmanTanh, ElmanSigmoid, ElmanSwish, ElmanGelu, ElmanNoGate
 from .gru import GRU
+from .skip_elman import SkipElman
 from .indrnn import IndRNN
 from .lstm import LSTM
 from .layer_norm_gru import LayerNormGRU
@@ -39,6 +40,7 @@ __all__ = [
     'ElmanGelu',
     'ElmanNoGate',
     'GRU',
+    'SkipElman',
     'IndRNN',
     'LSTM',
     'LayerNormGRU',
