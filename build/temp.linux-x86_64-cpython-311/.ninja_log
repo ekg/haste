@@ -35,3 +35,15 @@
 33	44274	1766270708200500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_silu.o	5d55b0f9a89ae9b0
 33	47037	1766270708200500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_variants.o	eb4ff622ebe03737
 37	47210	1766270708204500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_lstm.o	2e0c7636fc1d5feb
+48	46592	1766271577967500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/support.o	a7b834d2a1b21eb4
+43	48766	1766271577962500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_gru.o	1a10817859e329ad
+45	48992	1766271577964500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/lstm.o	6ec145e51de4fdc2
+44	49961	1766271577963500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_indrnn.o	118d5b1c8205abda
+41	50560	1766271577960500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_variants.o	eb4ff622ebe03737
+38	50764	1766271577957500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman.o	1c4c36915dde330a
+47	51035	1766271577966500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/skip_elman.o	b5de65022b231408
+46	52842	1766271577965500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/multihead_elman.o	2aeb752d6397e397
+40	53532	1766271577959500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_silu.o	5d55b0f9a89ae9b0
+44	53732	1766271577963500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_lstm.o	2e0c7636fc1d5feb
+42	55542	1766271577961500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/indrnn.o	38c6cc09cd8d9de6
+41	62233	1766271577960500062	/home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/gru.o	730446d965507c3c

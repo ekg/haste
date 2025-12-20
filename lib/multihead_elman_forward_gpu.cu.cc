@@ -201,7 +201,7 @@ void ForwardPass<T>::Run(
     const T* Wx,        // [nheads, headdim, headdim] - input weights
     const T* b,         // [nheads, headdim] - bias
     const T* x,         // [T, B, nheads, headdim] - input sequence
-    T* h,               // [B, nheads, headdim] - hidden state (in/out)
+    T* h,               // [T+1, B, nheads, headdim] - all hidden states (h[0]=h0 on input)
     T* y,               // [T, B, nheads, headdim] - output sequence
     T* pre_act,         // [T, B, nheads, headdim] - saved pre-activations
     T* tmp_Rh,          // [B, nheads, headdim] - workspace for R @ h
@@ -303,41 +303,38 @@ void ForwardPass<T>::Run(
     // =========================================================================
     // Main recurrence loop - this is where we need maximum efficiency!
     // =========================================================================
-    // For each timestep:
-    //   tmp_Rh = R @ h  (batched over heads)
-    //   y = activation(tmp_Rh + tmp_Wxx + b)
-    //   h = y
+    // h[0] = h0 (already initialized by caller)
+    // For each timestep t:
+    //   tmp_Rh = R @ h[t]  (batched over heads)
+    //   h[t+1] = y[t] = activation(tmp_Rh + tmp_Wxx[t] + b)
 
     for (int t = 0; t < steps; ++t) {
+        const T* h_t = h + t * BNH;           // Current hidden state
+        T* h_next = h + (t + 1) * BNH;        // Next hidden state
         const T* Wxx_t = tmp_Wxx + t * BNH;
         T* y_t = y + t * BNH;
         T* pre_act_t = training ? (pre_act + t * BNH) : nullptr;
 
         // =====================================================================
-        // Compute R @ h for ALL heads in ONE batched GEMM call!
+        // Compute R @ h[t] for ALL heads in ONE batched GEMM call!
         // =====================================================================
         // R: [nheads, headdim, headdim], strideA = headdim*headdim
-        // h: [B, nheads, headdim] -> view as nheads matrices of [headdim, B]
+        // h[t]: [B, nheads, headdim] -> view as nheads matrices of [headdim, B]
         //    For head n: h[:, n, :] is [B, headdim], viewed as [headdim, B] col-major
-        //    Start: h + n*headdim, ldb = NH, strideB = headdim
+        //    Start: h_t + n*headdim, ldb = NH, strideB = headdim
         // C: tmp_Rh same layout as h
-        //
-        // Each batch n: C[n] = R[n] @ h[n] where:
-        //   R[n] is [headdim, headdim]
-        //   h[n] is [headdim, B] (column-major view of [B, headdim] slice)
-        //   C[n] is [headdim, B]
 
         stridedBatchedGemm(blas_handle,
             CUBLAS_OP_N, CUBLAS_OP_N,
             headdim, batch_size, headdim,  // M, N, K
             &alpha,
             R, headdim, strideW,           // A=R, lda, strideA
-            h, NH, strideH,                // B=h, ldb=NH, strideB=headdim
+            h_t, NH, strideH,              // B=h[t], ldb=NH, strideB=headdim
             &beta_zero,
             tmp_Rh, NH, strideH,           // C, ldc=NH, strideC=headdim
             nheads);
 
-        // Fused activation kernel
+        // Fused activation kernel: writes to BOTH y[t] and h[t+1]
         const int threads = 256;
         const int blocks = (BNH + threads - 1) / threads;
 
@@ -352,8 +349,8 @@ void ForwardPass<T>::Run(
                 batch_size, nheads, headdim, tmp_Rh, Wxx_t, b, y_t, pre_act_t);
         }
 
-        // Copy y_t to h for next timestep
-        cudaMemcpyAsync(h, y_t, BNH * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+        // Copy y[t] to h[t+1] for next timestep
+        cudaMemcpyAsync(h_next, y_t, BNH * sizeof(T), cudaMemcpyDeviceToDevice, stream);
     }
 }
 
