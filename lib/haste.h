@@ -29,6 +29,7 @@
 #include "haste/elman_silu.h"
 #include "haste/elman_variants.h"
 #include "haste/gru.h"
+#include "haste/gru_silu.h"
 #include "haste/skip_elman.h"
 #include "haste/indrnn.h"
 #include "haste/layer_norm.h"
@@ -36,4 +37,5 @@
 #include "haste/layer_norm_indrnn.h"
 #include "haste/layer_norm_lstm.h"
 #include "haste/lstm.h"
+#include "haste/lstm_silu.h"
 #include "haste/multihead_elman.h"
