@@ -680,13 +680,13 @@ class ElmanLeakySelective(nn.Module):
 
 
 # ============================================================================
-# ElmanMamba: CLEANER Mamba2-style - input-only output selectivity
+# LeakyElman: Leaky integration RNN with input-only output selectivity
 # ============================================================================
 
-class ElmanMambaFunction(Function):
+class LeakyElmanFunction(Function):
     """
-    Same CUDA kernel as ElmanLeakySelective, but with INPUT-ONLY output gate.
-    This is closer to Mamba2's actual architecture where C depends only on x.
+    Leaky Elman RNN with INPUT-ONLY output gate.
+    Uses log-space discretization for stable training.
     """
     @staticmethod
     def forward(ctx, training, x, h0, Wx, R, bias, W_delta, b_delta, A, W_gate, b_gate, use_gate):
@@ -778,29 +778,29 @@ class ElmanMambaFunction(Function):
                 d_W_gate, d_b_gate, None)
 
 
-class ElmanMamba(nn.Module):
+class LeakyElman(nn.Module):
     """
-    CLEANER Mamba2-style RNN: nonlinear candidate + input-only output selectivity.
-
-    This is a CLOSER CRIB of Mamba2 than ElmanLeakySelective:
-    - Input-dependent Δ (timestep) via softplus
-    - Per-channel decay in log-space: decay_rate = exp(-exp(A_log))
-    - INPUT-ONLY output gate (NOT h+x!) - like Mamba2's C matrix
-    - Nonlinear candidate with tanh (our innovation beyond Mamba2)
+    Leaky Elman RNN with input-only output selectivity.
 
     Architecture:
-        candidate = tanh(R @ h + Wx @ x + b)     -- NONLINEAR
-        dt = softplus(W_delta @ x + b_delta)    -- input-dependent
+        candidate = tanh(R @ h + Wx @ x + b)     -- Elman candidate (nonlinear)
+        dt = softplus(W_delta @ x + b_delta)    -- input-dependent timestep
         decay_rate = exp(-exp(A_log))           -- log-space, ALWAYS in (0,1)
-        alpha = exp(-dt * decay_rate)
-        h_new = alpha * h + (1 - alpha) * candidate
+        alpha = exp(-dt * decay_rate)           -- blend factor
+        h_new = alpha * h + (1 - alpha) * candidate  -- leaky integration
 
         # Output (if use_gate=True):
-        gate = silu(W_gate @ x + b_gate)        -- INPUT-ONLY! No h!
+        gate = silu(W_gate @ x + b_gate)        -- INPUT-ONLY gate
         output = h_new * gate
 
         # Or (if use_gate=False):
-        output = h_new                          -- simplest
+        output = h_new                          -- no gating
+
+    Key features:
+    - Leaky integration: blends old state with new candidate
+    - Adaptive timestep: input-dependent blend factor
+    - Log-space decay: numerically stable, decay_rate always in (0,1)
+    - Input-only output gate: simpler than h+x gating
 
     Args:
         input_size: Dimension of input features.
@@ -866,7 +866,7 @@ class ElmanMamba(nn.Module):
         if h0 is None:
             h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
 
-        return ElmanMambaFunction.apply(
+        return LeakyElmanFunction.apply(
             self.training, x, h0, self.Wx, self.R, self.bias,
             self.W_delta, self.b_delta, self.A,
             self.W_gate, self.b_gate, self.use_gate
