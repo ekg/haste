@@ -28,6 +28,8 @@ __all__ = [
     'ElmanSwish',
     'ElmanGelu',
     'ElmanNoGate',
+    'ElmanLeaky',
+    'ElmanLeakySelective',
 ]
 
 
@@ -380,4 +382,295 @@ class ElmanNoGate(nn.Module):
 
         return ElmanNoGateFunction.apply(
             self.training, x, h0, self.Wx, self.R, self.bias
+        )
+
+
+# ============================================================================
+# ElmanLeaky: tanh + input-dependent leaky integration (Mamba2-style Δ)
+# ============================================================================
+
+class ElmanLeakyFunction(Function):
+    @staticmethod
+    def forward(ctx, training, x, h0, Wx, R, bias, delta):
+        # delta: [T, B, D] - precomputed delta values (sigmoid output)
+        h, v = lib.elman_leaky_forward(training, x, h0, Wx, R, bias, delta)
+
+        if training:
+            ctx.save_for_backward(x, Wx, R, h, v, delta)
+
+        return h[1:]
+
+    @staticmethod
+    def backward(ctx, grad_h):
+        x, Wx, R, h, v, delta = ctx.saved_tensors
+
+        B = x.size(1)
+        D = x.size(2)
+        dh_new = torch.zeros(grad_h.size(0) + 1, B, D,
+                           dtype=grad_h.dtype, device=grad_h.device)
+        dh_new[1:] = grad_h
+
+        dx, dh0, dWx, dR, dbias, d_delta = lib.elman_leaky_backward(
+            x, Wx, R, h, v, delta, dh_new)
+
+        return None, dx, dh0, dWx, dR, dbias, d_delta
+
+
+class ElmanLeaky(nn.Module):
+    """
+    Elman RNN with input-dependent leaky integration (Mamba2-style discretization).
+
+    Architecture:
+        candidate = tanh(R @ h + Wx @ x + b)
+        delta = sigmoid(W_delta @ x + b_delta)  -- input-dependent delta
+        h_new = (1 - delta) * h + delta * candidate  -- leaky integration
+
+    Key difference from standard gating: delta controls how much of the candidate
+    state is blended into the previous state. This is the discretized continuous
+    dynamics: dh/dt = -h + f(x), discretized as h[t] = (1-Δ)*h[t-1] + Δ*f(x[t],h[t-1]).
+
+    The recurrence matrix R sees the properly blended state h[t-1], not the
+    raw Elman output. This is critical for correct discretized dynamics.
+
+    Args:
+        input_size: Dimension of input features.
+        hidden_size: Dimension of hidden state.
+
+    Input shape: [T, B, D] (time-first)
+    Output shape: [T, B, D]
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, delta_init: float = -2.0):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.delta_init = delta_init
+
+        # Main Elman weights (no gate, so [D, D])
+        self.Wx = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.R = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.bias = nn.Parameter(torch.empty(hidden_size))
+
+        # Delta projection weights (input-dependent delta)
+        self.W_delta = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_delta = nn.Parameter(torch.empty(hidden_size))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 1.0 / (self.hidden_size ** 0.5)
+        nn.init.uniform_(self.Wx, -std, std)
+        nn.init.uniform_(self.R, -std, std)
+        nn.init.zeros_(self.bias)
+
+        # Initialize delta projection to produce values near sigmoid(delta_init)
+        nn.init.uniform_(self.W_delta, -std * 0.1, std * 0.1)
+        nn.init.constant_(self.b_delta, self.delta_init)  # sigmoid(-2) ≈ 0.12
+
+    def forward(self, x, h0=None):
+        T, B, D = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
+
+        # Compute input-dependent delta (can be parallelized over time)
+        x_flat = x.reshape(T * B, D)
+        delta_raw = torch.mm(x_flat, self.W_delta.t()) + self.b_delta
+        delta = torch.sigmoid(delta_raw).reshape(T, B, self.hidden_size)
+
+        return ElmanLeakyFunction.apply(
+            self.training, x, h0, self.Wx, self.R, self.bias, delta
+        )
+
+
+# ============================================================================
+# ElmanLeakySelective: tanh + Mamba2-style discretization + per-channel decay
+# ============================================================================
+
+class ElmanLeakySelectiveFunction(Function):
+    @staticmethod
+    def forward(ctx, training, x, h0, Wx, R, bias, W_delta, b_delta, A, W_gate_x, W_gate_h, b_gate):
+        T, B, D = x.shape
+
+        # Compute delta_raw in parallel (before softplus - kernel handles softplus)
+        x_flat = x.reshape(T * B, D)
+        delta_raw = (torch.mm(x_flat, W_delta.t()) + b_delta).reshape(T, B, D)
+
+        # Run the CUDA kernel
+        h, v = lib.elman_leaky_selective_forward(training, x, h0, Wx, R, bias, delta_raw, A)
+
+        # h is [T+1, B, D], we want [T, B, D] for hidden states h[1:]
+        h_out = h[1:]  # [T, B, D]
+
+        # Compute h+x selective output gate OUTSIDE the kernel (parallel over T)
+        # gate = silu(W_gate_x @ x + W_gate_h @ h + b_gate)
+        # output = h * gate
+        h_flat = h_out.reshape(T * B, D)
+        gate_raw = torch.mm(x_flat, W_gate_x.t()) + torch.mm(h_flat, W_gate_h.t()) + b_gate
+        gate = torch.nn.functional.silu(gate_raw)  # [T*B, D]
+        output = h_flat * gate  # [T*B, D]
+        output = output.reshape(T, B, D)
+
+        if training:
+            ctx.save_for_backward(x, Wx, R, h, v, delta_raw, A, W_delta,
+                                  W_gate_x, W_gate_h, b_gate, gate_raw, h_out)
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x, Wx, R, h, v, delta_raw, A, W_delta,
+         W_gate_x, W_gate_h, b_gate, gate_raw, h_out) = ctx.saved_tensors
+
+        T, B, D = x.shape
+
+        # Backward through output = h * gate where gate = silu(gate_raw)
+        x_flat = x.reshape(T * B, D)
+        h_flat = h_out.reshape(T * B, D)
+        grad_out_flat = grad_output.reshape(T * B, D)
+
+        # silu(x) = x * sigmoid(x)
+        # d_silu(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        sig = torch.sigmoid(gate_raw)
+        gate = gate_raw * sig  # silu
+        d_silu = sig * (1 + gate_raw * (1 - sig))
+
+        # Backward through output = h * gate
+        d_h_from_output = grad_out_flat * gate
+        d_gate = grad_out_flat * h_flat
+
+        # Backward through gate = silu(gate_raw)
+        d_gate_raw = d_gate * d_silu
+
+        # Backward through gate_raw = W_gate_x @ x + W_gate_h @ h + b_gate
+        d_W_gate_x = torch.mm(d_gate_raw.t(), x_flat)
+        d_W_gate_h = torch.mm(d_gate_raw.t(), h_flat)
+        d_b_gate = d_gate_raw.sum(0)
+        d_x_from_gate = torch.mm(d_gate_raw, W_gate_x)
+        d_h_from_gate = torch.mm(d_gate_raw, W_gate_h)
+
+        # Total gradient on h[1:] (from output gate and from next layers)
+        d_h_out = (d_h_from_output + d_h_from_gate).reshape(T, B, D)
+
+        # Pad to [T+1, B, D] for kernel backward
+        dh_new = torch.zeros(T + 1, B, D, dtype=x.dtype, device=x.device)
+        dh_new[1:] = d_h_out
+
+        # Call kernel backward
+        dx, dh0, dWx, dR, dbias, d_delta_raw, dA = lib.elman_leaky_selective_backward(
+            x, Wx, R, h, v, A, dh_new)
+
+        # Add gradient from gate computation to dx
+        dx = dx + d_x_from_gate.reshape(T, B, D)
+
+        # Gradient through delta_raw = W_delta @ x + b_delta
+        # delta_raw = x @ W_delta.t() + b_delta
+        # So: dW_delta = d_delta_raw.t() @ x, db_delta = d_delta_raw.sum(0)
+        # And: dx += d_delta_raw @ W_delta
+        d_delta_raw_flat = d_delta_raw.reshape(T * B, D)
+        d_W_delta = torch.mm(d_delta_raw_flat.t(), x_flat)
+        d_b_delta = d_delta_raw_flat.sum(0)
+        dx = dx + torch.mm(d_delta_raw_flat, W_delta).reshape(T, B, D)
+
+        return (None, dx, dh0, dWx, dR, dbias, d_W_delta, d_b_delta, dA,
+                d_W_gate_x, d_W_gate_h, d_b_gate)
+
+
+class ElmanLeakySelective(nn.Module):
+    """
+    Elman RNN with Mamba2-style discretization + per-channel decay + h+x output gate.
+
+    Architecture:
+        candidate = tanh(R @ h + Wx @ x + b)           -- NONLINEAR (our innovation!)
+        delta_raw = W_delta @ x + b_delta              -- input-dependent
+        dt = softplus(delta_raw)                       -- positive timestep
+
+        # Mamba-style log parameterization for numerical stability:
+        decay_rate = exp(-exp(A_log))                  -- ALWAYS in (0, 1)!
+        alpha = exp(-dt * decay_rate)                  -- per-channel blend factor
+
+        h_new = alpha * h + (1 - alpha) * candidate    -- exponential blend
+        gate = silu(W_gate_x @ x + W_gate_h @ h + b_gate)  -- h+x selective output
+        output = h * gate
+
+    Key features:
+    - Log-space A parameterization (decay_rate = exp(-exp(A_log)) is ALWAYS stable!)
+    - Per-channel decay rates (like Mamba2's diagonal A matrix)
+    - Input-dependent timestep via softplus (like Mamba2's Δ)
+    - NONLINEAR candidate (tanh) - our innovation beyond Mamba2!
+    - h+x output gate for selective output (computed outside kernel)
+
+    This is the target architecture for achieving Mamba2 parity with nonlinearity.
+
+    Args:
+        input_size: Dimension of input features.
+        hidden_size: Dimension of hidden state.
+        delta_init: Initial value for delta bias (default -2.0 -> softplus(-2)~0.13)
+        A_init_range: Range for A_log init (default (0.5, 2.0) for slow decay)
+
+    Input shape: [T, B, D] (time-first)
+    Output shape: [T, B, D]
+    """
+
+    def __init__(self, input_size: int, hidden_size: int,
+                 delta_init: float = -2.0,
+                 A_init_range: tuple = (0.5, 2.0)):  # Log-space: exp(-exp(0.5))=0.52, exp(-exp(2))≈0
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.delta_init = delta_init
+
+        # Main Elman weights (candidate computation)
+        self.Wx = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.R = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.bias = nn.Parameter(torch.empty(hidden_size))
+
+        # Delta projection weights (input-dependent timestep)
+        self.W_delta = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_delta = nn.Parameter(torch.empty(hidden_size))
+
+        # Per-channel decay rates (Mamba2's diagonal A)
+        self.A = nn.Parameter(torch.empty(hidden_size))
+
+        # h+x output gate weights
+        self.W_gate_x = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.W_gate_h = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.b_gate = nn.Parameter(torch.empty(hidden_size))
+
+        self._init_weights(A_init_range)
+
+    def _init_weights(self, A_init_range):
+        std = 1.0 / (self.hidden_size ** 0.5)
+
+        # Candidate projection
+        nn.init.uniform_(self.Wx, -std, std)
+        nn.init.uniform_(self.R, -std, std)
+        nn.init.zeros_(self.bias)
+
+        # Delta projection (small weights, bias controls initial delta)
+        nn.init.uniform_(self.W_delta, -std * 0.1, std * 0.1)
+        nn.init.constant_(self.b_delta, self.delta_init)
+
+        # Per-channel decay A_log (Mamba-style log parameterization)
+        # decay_rate = exp(-exp(A_log)), ALWAYS in (0, 1) for stability!
+        # A_log in (0.5, 2.0): decay_rate in (0.52, 0.0006)
+        # With softplus(-2) ~ 0.13 and decay_rate ~ 0.1:
+        #   alpha = exp(-0.13 * 0.1) ~ 0.987 (slow dynamics initially)
+        nn.init.uniform_(self.A, A_init_range[0], A_init_range[1])
+
+        # Output gate
+        nn.init.uniform_(self.W_gate_x, -std, std)
+        nn.init.uniform_(self.W_gate_h, -std, std)
+        nn.init.zeros_(self.b_gate)
+
+    def forward(self, x, h0=None):
+        T, B, D = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
+
+        return ElmanLeakySelectiveFunction.apply(
+            self.training, x, h0, self.Wx, self.R, self.bias,
+            self.W_delta, self.b_delta, self.A,
+            self.W_gate_x, self.W_gate_h, self.b_gate
         )
