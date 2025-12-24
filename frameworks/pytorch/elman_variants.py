@@ -614,7 +614,7 @@ class ElmanLeakySelective(nn.Module):
 
     def __init__(self, input_size: int, hidden_size: int,
                  delta_init: float = 3.0,  # softplus(3) ≈ 3.0 for meaningful timestep
-                 A_init_range: tuple = (-1.5, -0.5)):  # softplus gives rate in (0.18, 0.47)
+                 A_init_range: tuple = (-0.5, 0.5)):  # LOG-SPACE: decay_rate = exp(-exp(A))
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -651,11 +651,14 @@ class ElmanLeakySelective(nn.Module):
         nn.init.uniform_(self.W_delta, -std * 0.1, std * 0.1)
         nn.init.constant_(self.b_delta, self.delta_init)
 
-        # Per-channel decay rate A (SIMPLIFIED formula)
-        # rate = softplus(A), alpha = exp(-dt * rate)
-        # A in (-1.5, -0.5): rate = softplus(A) in (0.18, 0.47)
-        # With dt = softplus(3) ≈ 3.0:
-        #   alpha = exp(-3.0 * 0.3) = exp(-0.9) ≈ 0.41 (candidate has ~59% influence)
+        # Per-channel decay rate A (LOG-SPACE formula for stability)
+        # decay_rate = exp(-exp(A_log)) -- ALWAYS in (0, 1) no matter what A is!
+        # alpha = exp(-dt * decay_rate)
+        #
+        # A_log in (-0.5, 0.5):
+        #   A=-0.5 → decay_rate = exp(-0.6) = 0.55, alpha = exp(-1.65) = 0.19 → 81% candidate
+        #   A= 0.0 → decay_rate = exp(-1.0) = 0.37, alpha = exp(-1.11) = 0.33 → 67% candidate
+        #   A= 0.5 → decay_rate = exp(-1.65) = 0.19, alpha = exp(-0.57) = 0.57 → 43% candidate
         nn.init.uniform_(self.A, A_init_range[0], A_init_range[1])
 
         # Output gate

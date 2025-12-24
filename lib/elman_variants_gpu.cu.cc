@@ -1884,23 +1884,26 @@ void ElmanLeakySelectivePointwiseKernel(
     float a_raw = static_cast<float>(A[d_idx]);  // A is raw learnable param
     float h_p = static_cast<float>(h_prev[idx]);
 
-    // SIMPLIFIED Mamba-style parameterization:
-    // dt = softplus(delta_raw)  -- input-dependent timestep
-    // rate = softplus(A)        -- per-channel decay rate (always positive!)
-    // alpha = exp(-dt * rate)   -- blend factor
+    // LOG-SPACE Mamba-style parameterization (STABLE!):
+    // dt = softplus(delta_raw)      -- input-dependent timestep (always positive)
+    // decay_rate = exp(-exp(A_log)) -- ALWAYS in (0, 1) no matter what A_log is!
+    // alpha = exp(-dt * decay_rate) -- blend factor
     //
-    // With A initialized to ~0: rate = softplus(0) = 0.693,
-    // and dt = softplus(3) = 3.05 → alpha = exp(-2.1) = 0.12
-    // This gives candidate ~88% influence!
+    // Why log-space? exp(-exp(x)) maps ANY x → (0, 1):
+    //   A_log = -2 → decay_rate = exp(-0.14) = 0.87
+    //   A_log = -1 → decay_rate = exp(-0.37) = 0.69
+    //   A_log =  0 → decay_rate = exp(-1.00) = 0.37
+    //   A_log =  1 → decay_rate = exp(-2.72) = 0.07
     //
-    // A can learn positive (faster decay) or negative (slower decay)
-    // Without the double exponential, gradients flow more directly.
+    // This prevents alpha from going to extremes during training.
+    // The double exponential constrains the learning dynamics naturally.
 
     float dt = device_softplus(d_raw);
-    float rate = device_softplus(a_raw);  // Always positive, simpler than exp(-exp())
+    float decay_rate = expf(-expf(a_raw));  // Log-space: ALWAYS in (0, 1)
 
-    // alpha = exp(-dt * rate), always in (0, 1)
-    float alpha = expf(-dt * rate);
+    // alpha = exp(-dt * decay_rate)
+    // With dt=3, decay_rate=0.37: alpha = exp(-1.1) = 0.33 → 67% candidate
+    float alpha = expf(-dt * decay_rate);
 
     // Small epsilon for numerical stability in backward
     alpha = fmaxf(alpha, 1e-6f);
@@ -1948,10 +1951,10 @@ void ElmanLeakySelectiveBackwardPointwiseKernel(
 
     const float candidate = tanhf(raw);
     const float dt = device_softplus(d_raw_val);
-    const float rate = device_softplus(a_raw);  // Always positive
+    const float decay_rate = expf(-expf(a_raw));  // Log-space: ALWAYS in (0, 1)
 
-    // SIMPLIFIED: alpha = exp(-dt * rate)
-    float alpha = expf(-dt * rate);
+    // LOG-SPACE: alpha = exp(-dt * decay_rate)
+    float alpha = expf(-dt * decay_rate);
     alpha = fmaxf(alpha, 1e-6f);
     alpha = fminf(alpha, 1.0f - 1e-6f);
 
@@ -1965,18 +1968,22 @@ void ElmanLeakySelectiveBackwardPointwiseKernel(
     const float d_h_prev = dh * alpha;
     const float d_alpha = dh * (h_p - candidate);
 
-    // Backward through: alpha = exp(-dt * rate)
-    // d/d(rate) exp(-dt * rate) = -dt * exp(-dt * rate) = -dt * alpha
-    const float d_rate = d_alpha * (-dt * alpha);
-    // d/d(dt) exp(-dt * rate) = -rate * exp(-dt * rate) = -rate * alpha
-    const float d_dt = d_alpha * (-rate * alpha);
+    // Backward through: alpha = exp(-dt * decay_rate)
+    // d/d(decay_rate) alpha = -dt * alpha
+    const float d_decay_rate = d_alpha * (-dt * alpha);
+    // d/d(dt) alpha = -decay_rate * alpha
+    const float d_dt = d_alpha * (-decay_rate * alpha);
 
-    // Backward through: rate = softplus(a_raw)
-    // d/dx softplus(x) = sigmoid(x) = 1 / (1 + exp(-x))
-    const float sigmoid_a_raw = 1.0f / (1.0f + expf(-a_raw));
-    const float d_a_raw = d_rate * sigmoid_a_raw;
+    // Backward through: decay_rate = exp(-exp(A_log))
+    // Let u = exp(A_log), decay_rate = exp(-u)
+    // d(decay_rate)/d(A_log) = d(exp(-u))/du * du/d(A_log)
+    //                        = -exp(-u) * exp(A_log)
+    //                        = -decay_rate * exp(A_log)
+    const float exp_a_raw = expf(a_raw);
+    const float d_a_raw = d_decay_rate * (-decay_rate * exp_a_raw);
 
     // Backward through: dt = softplus(d_raw_val)
+    // d/dx softplus(x) = sigmoid(x)
     const float sigmoid_d_raw = 1.0f / (1.0f + expf(-d_raw_val));
     const float d_delta_raw_val = d_dt * sigmoid_d_raw;
 
