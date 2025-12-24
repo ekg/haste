@@ -29,7 +29,9 @@ __all__ = [
     'ElmanGelu',
     'ElmanNoGate',
     'ElmanLeaky',
+    'ElmanLeakySilu',
     'ElmanLeakySelective',
+    'LeakyElman',
 ]
 
 
@@ -479,6 +481,102 @@ class ElmanLeaky(nn.Module):
         delta = torch.sigmoid(delta_raw).reshape(T, B, self.hidden_size)
 
         return ElmanLeakyFunction.apply(
+            self.training, x, h0, self.Wx, self.R, self.bias, delta
+        )
+
+
+# ============================================================================
+# ElmanLeakySilu: silu + leaky integration (NO output gate)
+# ============================================================================
+
+class ElmanLeakySiluFunction(Function):
+    @staticmethod
+    def forward(ctx, training, x, h0, Wx, R, bias, delta):
+        # delta: [T, B, D] - precomputed delta values (sigmoid output)
+        h, v = lib.elman_leaky_silu_forward(training, x, h0, Wx, R, bias, delta)
+
+        if training:
+            ctx.save_for_backward(x, Wx, R, h, v, delta)
+
+        return h[1:]
+
+    @staticmethod
+    def backward(ctx, grad_h):
+        x, Wx, R, h, v, delta = ctx.saved_tensors
+
+        B = x.size(1)
+        D = x.size(2)
+        dh_new = torch.zeros(grad_h.size(0) + 1, B, D,
+                           dtype=grad_h.dtype, device=grad_h.device)
+        dh_new[1:] = grad_h
+
+        dx, dh0, dWx, dR, dbias, d_delta = lib.elman_leaky_silu_backward(
+            x, Wx, R, h, v, delta, dh_new)
+
+        return None, dx, dh0, dWx, dR, dbias, d_delta
+
+
+class ElmanLeakySilu(nn.Module):
+    """
+    Elman RNN with silu activation and leaky integration (NO output gate).
+
+    Architecture:
+        candidate = silu(R @ h + Wx @ x + b)          -- silu instead of tanh!
+        delta = sigmoid(W_delta @ x + b_delta)        -- input-dependent delta
+        h_new = (1 - delta) * h + delta * candidate   -- leaky integration
+        output = h_new                                -- NO output gate!
+
+    Same as ElmanLeaky but uses silu instead of tanh.
+    silu(x) = x * sigmoid(x) often performs better than tanh in modern nets.
+
+    Args:
+        input_size: Dimension of input features.
+        hidden_size: Dimension of hidden state.
+        delta_init: Initial bias for delta projection (default -2.0)
+
+    Input shape: [T, B, D] (time-first)
+    Output shape: [T, B, D]
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, delta_init: float = -2.0):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.delta_init = delta_init
+
+        # Main Elman weights
+        self.Wx = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.R = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.bias = nn.Parameter(torch.empty(hidden_size))
+
+        # Delta projection weights (input-dependent delta)
+        self.W_delta = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_delta = nn.Parameter(torch.empty(hidden_size))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 1.0 / (self.hidden_size ** 0.5)
+        nn.init.uniform_(self.Wx, -std, std)
+        nn.init.uniform_(self.R, -std, std)
+        nn.init.zeros_(self.bias)
+
+        # Initialize delta projection to produce values near sigmoid(delta_init)
+        nn.init.uniform_(self.W_delta, -std * 0.1, std * 0.1)
+        nn.init.constant_(self.b_delta, self.delta_init)
+
+    def forward(self, x, h0=None):
+        T, B, D = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
+
+        # Compute input-dependent delta (can be parallelized over time)
+        x_flat = x.reshape(T * B, D)
+        delta_raw = torch.mm(x_flat, self.W_delta.t()) + self.b_delta
+        delta = torch.sigmoid(delta_raw).reshape(T, B, self.hidden_size)
+
+        return ElmanLeakySiluFunction.apply(
             self.training, x, h0, self.Wx, self.R, self.bias, delta
         )
 
