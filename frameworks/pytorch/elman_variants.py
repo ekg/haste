@@ -677,3 +677,197 @@ class ElmanLeakySelective(nn.Module):
             self.W_delta, self.b_delta, self.A,
             self.W_gate_x, self.W_gate_h, self.b_gate
         )
+
+
+# ============================================================================
+# ElmanMamba: CLEANER Mamba2-style - input-only output selectivity
+# ============================================================================
+
+class ElmanMambaFunction(Function):
+    """
+    Same CUDA kernel as ElmanLeakySelective, but with INPUT-ONLY output gate.
+    This is closer to Mamba2's actual architecture where C depends only on x.
+    """
+    @staticmethod
+    def forward(ctx, training, x, h0, Wx, R, bias, W_delta, b_delta, A, W_gate, b_gate, use_gate):
+        T, B, D = x.shape
+
+        # Compute delta_raw (input-dependent timestep)
+        x_flat = x.reshape(T * B, D)
+        delta_raw = (torch.mm(x_flat, W_delta.t()) + b_delta).reshape(T, B, D)
+
+        # Run CUDA kernel - gets raw h_new (discretized state)
+        h, v = lib.elman_leaky_selective_forward(training, x, h0, Wx, R, bias, delta_raw, A)
+
+        # h is [T+1, B, D], we want h[1:]
+        h_out = h[1:]  # [T, B, D]
+        h_flat = h_out.reshape(T * B, D)
+
+        # OUTPUT: INPUT-ONLY gate (like Mamba2's C) or no gate
+        if use_gate:
+            # gate = silu(W_gate @ x + b_gate) - depends ONLY on x!
+            gate_raw = torch.mm(x_flat, W_gate.t()) + b_gate
+            gate = torch.nn.functional.silu(gate_raw)
+            output = h_flat * gate
+        else:
+            # No gate - just return raw h
+            gate_raw = None
+            gate = None
+            output = h_flat
+
+        output = output.reshape(T, B, D)
+
+        if training:
+            ctx.save_for_backward(x, Wx, R, h, v, delta_raw, A, W_delta, W_gate, b_gate, gate_raw, h_out)
+            ctx.use_gate = use_gate
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, Wx, R, h, v, delta_raw, A, W_delta, W_gate, b_gate, gate_raw, h_out = ctx.saved_tensors
+        use_gate = ctx.use_gate
+
+        T, B, D = x.shape
+        x_flat = x.reshape(T * B, D)
+        h_flat = h_out.reshape(T * B, D)
+        grad_out_flat = grad_output.reshape(T * B, D)
+
+        if use_gate:
+            # Backward through output = h * gate where gate = silu(W_gate @ x)
+            sig = torch.sigmoid(gate_raw)
+            gate = gate_raw * sig  # silu
+            d_silu = sig * (1 + gate_raw * (1 - sig))
+
+            d_h_from_output = grad_out_flat * gate
+            d_gate = grad_out_flat * h_flat
+            d_gate_raw = d_gate * d_silu
+
+            # Backward through gate_raw = W_gate @ x + b_gate (NO h term!)
+            d_W_gate = torch.mm(d_gate_raw.t(), x_flat)
+            d_b_gate = d_gate_raw.sum(0)
+            d_x_from_gate = torch.mm(d_gate_raw, W_gate)
+        else:
+            # No gate - gradient flows directly
+            d_h_from_output = grad_out_flat
+            d_W_gate = torch.zeros_like(W_gate)
+            d_b_gate = torch.zeros_like(b_gate)
+            d_x_from_gate = torch.zeros_like(x_flat)
+
+        # Gradient on h
+        d_h_out = d_h_from_output.reshape(T, B, D)
+
+        # Pad for kernel backward
+        dh_new = torch.zeros(T + 1, B, D, dtype=x.dtype, device=x.device)
+        dh_new[1:] = d_h_out
+
+        # Call kernel backward
+        dx, dh0, dWx, dR, dbias, d_delta_raw, dA = lib.elman_leaky_selective_backward(
+            x, Wx, R, h, v, A, dh_new)
+
+        # Add gradient from gate computation to dx
+        dx = dx + d_x_from_gate.reshape(T, B, D)
+
+        # Gradient through delta_raw
+        d_delta_raw_flat = d_delta_raw.reshape(T * B, D)
+        d_W_delta = torch.mm(d_delta_raw_flat.t(), x_flat)
+        d_b_delta = d_delta_raw_flat.sum(0)
+        dx = dx + torch.mm(d_delta_raw_flat, W_delta).reshape(T, B, D)
+
+        return (None, dx, dh0, dWx, dR, dbias, d_W_delta, d_b_delta, dA,
+                d_W_gate, d_b_gate, None)
+
+
+class ElmanMamba(nn.Module):
+    """
+    CLEANER Mamba2-style RNN: nonlinear candidate + input-only output selectivity.
+
+    This is a CLOSER CRIB of Mamba2 than ElmanLeakySelective:
+    - Input-dependent Δ (timestep) via softplus
+    - Per-channel decay in log-space: decay_rate = exp(-exp(A_log))
+    - INPUT-ONLY output gate (NOT h+x!) - like Mamba2's C matrix
+    - Nonlinear candidate with tanh (our innovation beyond Mamba2)
+
+    Architecture:
+        candidate = tanh(R @ h + Wx @ x + b)     -- NONLINEAR
+        dt = softplus(W_delta @ x + b_delta)    -- input-dependent
+        decay_rate = exp(-exp(A_log))           -- log-space, ALWAYS in (0,1)
+        alpha = exp(-dt * decay_rate)
+        h_new = alpha * h + (1 - alpha) * candidate
+
+        # Output (if use_gate=True):
+        gate = silu(W_gate @ x + b_gate)        -- INPUT-ONLY! No h!
+        output = h_new * gate
+
+        # Or (if use_gate=False):
+        output = h_new                          -- simplest
+
+    Args:
+        input_size: Dimension of input features.
+        hidden_size: Dimension of hidden state.
+        delta_init: Initial delta bias (3.0 for meaningful timestep)
+        A_init_range: Range for A_log initialization
+        use_gate: Whether to use input-only output gate (default True)
+    """
+
+    def __init__(self, input_size: int, hidden_size: int,
+                 delta_init: float = 3.0,
+                 A_init_range: tuple = (-0.5, 0.5),
+                 use_gate: bool = True):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.delta_init = delta_init
+        self.use_gate = use_gate
+
+        # Candidate computation weights
+        self.Wx = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.R = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.bias = nn.Parameter(torch.empty(hidden_size))
+
+        # Delta projection (input-dependent timestep)
+        self.W_delta = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_delta = nn.Parameter(torch.empty(hidden_size))
+
+        # Per-channel decay rate (log-space A)
+        self.A = nn.Parameter(torch.empty(hidden_size))
+
+        # Input-only output gate (like Mamba2's C)
+        self.W_gate = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_gate = nn.Parameter(torch.empty(hidden_size))
+
+        self._init_weights(A_init_range)
+
+    def _init_weights(self, A_init_range):
+        std = 1.0 / (self.hidden_size ** 0.5)
+
+        # Candidate projection
+        nn.init.uniform_(self.Wx, -std, std)
+        nn.init.uniform_(self.R, -std, std)
+        nn.init.zeros_(self.bias)
+
+        # Delta projection
+        nn.init.uniform_(self.W_delta, -std * 0.1, std * 0.1)
+        nn.init.constant_(self.b_delta, self.delta_init)
+
+        # Per-channel decay rate A (log-space)
+        # decay_rate = exp(-exp(A_log))
+        # A in (-0.5, 0.5) gives decay_rate in (0.19, 0.55)
+        # With dt=3: alpha in (0.19, 0.57) -> 43-81% candidate influence
+        nn.init.uniform_(self.A, A_init_range[0], A_init_range[1])
+
+        # Output gate (input-only)
+        nn.init.uniform_(self.W_gate, -std, std)
+        nn.init.zeros_(self.b_gate)
+
+    def forward(self, x, h0=None):
+        T, B, D = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
+
+        return ElmanMambaFunction.apply(
+            self.training, x, h0, self.Wx, self.R, self.bias,
+            self.W_delta, self.b_delta, self.A,
+            self.W_gate, self.b_gate, self.use_gate
+        )
