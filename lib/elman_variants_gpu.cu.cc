@@ -1881,34 +1881,30 @@ void ElmanLeakySelectivePointwiseKernel(
 
     float candidate = tanhf(raw);
     float d_raw = static_cast<float>(delta_raw[idx]);
-    float a_log = static_cast<float>(A[d_idx]);  // A is stored in log-space!
+    float a_raw = static_cast<float>(A[d_idx]);  // A is raw learnable param
     float h_p = static_cast<float>(h_prev[idx]);
 
-    // Mamba-style log parameterization for stability:
-    // A_real = -exp(A_log)  -- always negative!
-    // decay_rate = exp(A_real) = exp(-exp(A_log))  -- always in (0, 1)!
-    // alpha = exp(-dt * decay_rate)
+    // SIMPLIFIED Mamba-style parameterization:
+    // dt = softplus(delta_raw)  -- input-dependent timestep
+    // rate = softplus(A)        -- per-channel decay rate (always positive!)
+    // alpha = exp(-dt * rate)   -- blend factor
     //
-    // This ensures decay_rate never explodes regardless of A_log value.
-    // A_log = 0  → A_real = -1    → decay_rate = 0.37
-    // A_log = 2  → A_real = -7.4  → decay_rate = 0.0006 (fast decay)
-    // A_log = -2 → A_real = -0.14 → decay_rate = 0.87 (slow decay)
+    // With A initialized to ~0: rate = softplus(0) = 0.693,
+    // and dt = softplus(3) = 3.05 → alpha = exp(-2.1) = 0.12
+    // This gives candidate ~88% influence!
+    //
+    // A can learn positive (faster decay) or negative (slower decay)
+    // Without the double exponential, gradients flow more directly.
 
     float dt = device_softplus(d_raw);
+    float rate = device_softplus(a_raw);  // Always positive, simpler than exp(-exp())
 
-    // Clamp A_log to prevent exp(-exp(large)) underflow
-    // A_log in [-4, 4] → exp(A_log) in [0.018, 55] → decay_rate in [1e-24, 0.98]
-    float a_log_clamped = fmaxf(-4.0f, fminf(a_log, 4.0f));
-    float neg_a_real = expf(a_log_clamped);  // This is -A_real = exp(A_log)
-    float decay_rate = expf(-neg_a_real);     // exp(-exp(A_log)), always in (0,1)
-
-    // alpha = exp(-dt * decay_rate)
-    // Since decay_rate < 1 and dt is typically small, this is stable
-    float neg_dt_decay = dt * decay_rate;
-    float alpha = expf(-neg_dt_decay);
+    // alpha = exp(-dt * rate), always in (0, 1)
+    float alpha = expf(-dt * rate);
 
     // Small epsilon for numerical stability in backward
     alpha = fmaxf(alpha, 1e-6f);
+    alpha = fminf(alpha, 1.0f - 1e-6f);  // Also clamp upper bound
 
     // Leaky integration with Mamba2-style blend
     float h_new = alpha * h_p + (1.0f - alpha) * candidate;
@@ -1947,19 +1943,17 @@ void ElmanLeakySelectiveBackwardPointwiseKernel(
 
     const float raw = static_cast<float>(v[v_idx]);
     const float d_raw_val = static_cast<float>(v[v_idx + D]);
-    const float a_log = static_cast<float>(A[d_idx]);  // A is stored in log-space!
+    const float a_raw = static_cast<float>(A[d_idx]);  // A is raw learnable param
     const float h_p = static_cast<float>(h_prev[idx]);
 
     const float candidate = tanhf(raw);
     const float dt = device_softplus(d_raw_val);
+    const float rate = device_softplus(a_raw);  // Always positive
 
-    // Mamba-style log parameterization: match forward pass exactly
-    float a_log_clamped = fmaxf(-4.0f, fminf(a_log, 4.0f));
-    float neg_a_real = expf(a_log_clamped);   // exp(A_log) = -A_real
-    float decay_rate = expf(-neg_a_real);      // exp(-exp(A_log)), always in (0,1)
-    float neg_dt_decay = dt * decay_rate;
-    float alpha = expf(-neg_dt_decay);
+    // SIMPLIFIED: alpha = exp(-dt * rate)
+    float alpha = expf(-dt * rate);
     alpha = fmaxf(alpha, 1e-6f);
+    alpha = fminf(alpha, 1.0f - 1e-6f);
 
     float dh = static_cast<float>(dh_out[idx]);
     if (dh_recurrent != nullptr) {
@@ -1971,24 +1965,18 @@ void ElmanLeakySelectiveBackwardPointwiseKernel(
     const float d_h_prev = dh * alpha;
     const float d_alpha = dh * (h_p - candidate);
 
-    // Backward through: alpha = exp(-dt * decay_rate)
-    // d/d(dt*decay) exp(-x) = -exp(-x)
-    const float d_neg_dt_decay = -d_alpha * alpha;
-    const float d_dt = d_neg_dt_decay * decay_rate;
-    const float d_decay_rate = d_neg_dt_decay * dt;
+    // Backward through: alpha = exp(-dt * rate)
+    // d/d(rate) exp(-dt * rate) = -dt * exp(-dt * rate) = -dt * alpha
+    const float d_rate = d_alpha * (-dt * alpha);
+    // d/d(dt) exp(-dt * rate) = -rate * exp(-dt * rate) = -rate * alpha
+    const float d_dt = d_alpha * (-rate * alpha);
 
-    // Backward through: decay_rate = exp(-neg_a_real)
-    // d/d(neg_a_real) exp(-x) = -exp(-x) = -decay_rate
-    const float d_neg_a_real = -d_decay_rate * decay_rate;
-
-    // Backward through: neg_a_real = exp(a_log_clamped)
-    // d/d(a_log) exp(x) = exp(x) = neg_a_real
-    // Only propagate if A_log wasn't clamped
-    const float d_a_log = (a_log >= -4.0f && a_log <= 4.0f)
-                          ? (d_neg_a_real * neg_a_real) : 0.0f;
+    // Backward through: rate = softplus(a_raw)
+    // d/dx softplus(x) = sigmoid(x) = 1 / (1 + exp(-x))
+    const float sigmoid_a_raw = 1.0f / (1.0f + expf(-a_raw));
+    const float d_a_raw = d_rate * sigmoid_a_raw;
 
     // Backward through: dt = softplus(d_raw_val)
-    // d/dx softplus(x) = sigmoid(x) = 1 / (1 + exp(-x))
     const float sigmoid_d_raw = 1.0f / (1.0f + expf(-d_raw_val));
     const float d_delta_raw_val = d_dt * sigmoid_d_raw;
 
@@ -2001,8 +1989,7 @@ void ElmanLeakySelectiveBackwardPointwiseKernel(
     dh_prev_out[idx] = static_cast<T>(d_h_prev);
 
     // Atomic add for dA since multiple batch elements contribute
-    // dA accumulates gradients w.r.t. A_log (log-space parameterization)
-    atomicAdd(&dA[d_idx], d_a_log);
+    atomicAdd(&dA[d_idx], d_a_raw);
 }
 
 }  // anonymous namespace
