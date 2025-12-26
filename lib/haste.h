@@ -39,3 +39,7 @@
 #include "haste/lstm.h"
 #include "haste/lstm_silu.h"
 #include "haste/multihead_elman.h"
+#include "haste/elman_triple_r.h"
+#include "haste/elman_selective_triple_r.h"
+#include "haste/elman_neural_memory.h"
+#include "haste/elman_lowrank_r.h"
