@@ -1831,6 +1831,1403 @@ template struct BackwardPass<__nv_bfloat16>;
 }  // namespace elman_leaky
 
 // ============================================================================
+// ElmanLeakyMamba2Delta Implementation (Mamba2-style softplus/exp delta)
+// ============================================================================
+// Like ElmanLeaky but with Mamba2's log-space delta parameterization:
+// - delta_raw = W_delta @ x + b_delta        -- raw (can be any real)
+// - delta = softplus(delta_raw)              -- always positive
+// - decay = exp(-delta)                      -- between 0 and 1
+// - candidate = tanh(R @ h + Wx @ x + b)     -- same as ElmanLeaky
+// - h_new = decay * h + (1 - decay) * candidate
+//
+// Advantages over sigmoid:
+// - Wider dynamic range (delta can be 0.001 to 100+)
+// - Better gradients (softplus linear for large values)
+// - More numerically stable (log-space parameterization)
+namespace elman_leaky_mamba2_delta {
+
+namespace {
+
+__device__ __forceinline__ float device_softplus(float x) {
+    // Numerically stable softplus: log(1 + exp(x))
+    if (x > 20.0f) return x;  // For large x, softplus(x) ≈ x
+    return logf(1.0f + expf(x));
+}
+
+__device__ __forceinline__ float device_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+template<typename T>
+__global__
+void ElmanLeakyMamba2DeltaPointwiseKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ Rh,           // [B, D] - R @ h_prev
+    const T* __restrict__ Wx,           // [B, D]
+    const T* __restrict__ b,            // [D]
+    const T* __restrict__ delta_raw,    // [B, D] - RAW delta (before softplus!)
+    const T* __restrict__ h_prev,       // [B, D] - previous hidden state
+    T* __restrict__ h_next,             // [B, D] - output
+    T* __restrict__ v,                  // [B, D] - save pre-activation
+    T* __restrict__ decay_cache         // [B, D] - save decay for backward
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    float raw = static_cast<float>(Rh[idx]) +
+                static_cast<float>(Wx[idx]) +
+                static_cast<float>(b[idx % D]);
+
+    float candidate = tanhf(raw);
+    float d_raw = static_cast<float>(delta_raw[idx]);
+    float h_p = static_cast<float>(h_prev[idx]);
+
+    // Mamba2-style: softplus then exp for decay
+    float delta = device_softplus(d_raw);
+    float decay = expf(-delta);
+
+    // h_new = decay * h + (1 - decay) * candidate
+    float h_new = decay * h_p + (1.0f - decay) * candidate;
+
+    h_next[idx] = static_cast<T>(h_new);
+    v[idx] = static_cast<T>(raw);
+    decay_cache[idx] = static_cast<T>(decay);  // Save for backward
+}
+
+template<typename T>
+__global__
+void ElmanLeakyMamba2DeltaBackwardPointwiseKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ dh_out,         // [B, D] - gradient from output
+    const T* __restrict__ dh_recurrent,   // [B, D] - gradient from next timestep
+    const T* __restrict__ v,              // [B, D] - pre-activation (raw)
+    const T* __restrict__ delta_raw,      // [B, D] - raw delta
+    const T* __restrict__ decay_cache,    // [B, D] - cached decay
+    const T* __restrict__ h_prev,         // [B, D] - previous hidden state
+    T* __restrict__ d_raw,                // [B, D] - gradient w.r.t. pre-activation
+    T* __restrict__ d_delta_raw,          // [B, D] - gradient w.r.t. raw delta
+    T* __restrict__ dh_prev_out           // [B, D] - gradient w.r.t. h_prev
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    const float raw = static_cast<float>(v[idx]);
+    const float candidate = tanhf(raw);
+    const float d_raw_val = static_cast<float>(delta_raw[idx]);
+    const float decay = static_cast<float>(decay_cache[idx]);
+    const float h_p = static_cast<float>(h_prev[idx]);
+
+    float dh = static_cast<float>(dh_out[idx]);
+    if (dh_recurrent != nullptr) {
+        dh += static_cast<float>(dh_recurrent[idx]);
+    }
+
+    // h_new = decay * h_prev + (1 - decay) * candidate
+    // d_candidate = dh * (1 - decay)
+    // d_h_prev = dh * decay
+    // d_decay = dh * (h_prev - candidate)
+
+    const float d_candidate = dh * (1.0f - decay);
+    const float d_h_prev = dh * decay;
+    const float d_decay = dh * (h_p - candidate);
+
+    // decay = exp(-softplus(delta_raw))
+    // d_decay/d_delta_raw = -decay * sigmoid(delta_raw)
+    const float sigmoid_d_raw = device_sigmoid(d_raw_val);
+    const float d_delta_raw_val = d_decay * (-decay) * sigmoid_d_raw;
+
+    // d/dx tanh(x) = 1 - tanh(x)^2
+    const float d_raw_out = d_candidate * (1.0f - candidate * candidate);
+
+    d_raw[idx] = static_cast<T>(d_raw_out);
+    d_delta_raw[idx] = static_cast<T>(d_delta_raw_val);
+    dh_prev_out[idx] = static_cast<T>(d_h_prev);
+}
+
+}  // anonymous namespace
+
+template<typename T>
+struct ForwardPass<T>::private_data {
+    bool training;
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    cublasHandle_t blas_handle;
+    cudaStream_t stream;
+};
+
+template<typename T>
+ForwardPass<T>::ForwardPass(
+    const bool training,
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const cublasHandle_t& blas_handle,
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->training = training;
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->blas_handle = blas_handle;
+    data_->stream = stream;
+}
+
+template<typename T>
+ForwardPass<T>::~ForwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void ForwardPass<T>::Run(
+    const int steps,
+    const T* R,            // [D, D]
+    const T* b,            // [D]
+    const T* Wx,           // [T*B, D]
+    const T* delta_raw,    // [T*B, D] - RAW delta (before softplus!)
+    T* h,                  // [(T+1)*B, D]
+    T* v,                  // [T*B, D]
+    T* decay_cache,        // [T*B, D] - cache decay for backward
+    T* tmp_Rh              // [B, D]
+) {
+    static const T alpha = static_cast<T>(1.0);
+    static const T beta = static_cast<T>(0.0);
+
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+
+    cudaStream_t stream = data_->stream;
+    cublasHandle_t blas_handle = data_->blas_handle;
+
+    cudaStream_t save_stream;
+    cublasGetStream(blas_handle, &save_stream);
+    cublasSetStream(blas_handle, stream);
+
+    for (int t = 0; t < steps; ++t) {
+        const T* h_t = h + t * BD;
+        T* h_next = h + (t + 1) * BD;
+        T* v_t = v + t * BD;
+        T* decay_t = decay_cache + t * BD;
+        const T* Wx_t = Wx + t * BD;
+        const T* delta_raw_t = delta_raw + t * BD;
+
+        // Rh = R @ h_t
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            D, batch_size, D,
+            &alpha,
+            R, D,
+            h_t, D,
+            &beta,
+            tmp_Rh, D);
+
+        const int threads = 256;
+        const int blocks = (BD + threads - 1) / threads;
+
+        ElmanLeakyMamba2DeltaPointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, tmp_Rh, Wx_t, b, delta_raw_t, h_t, h_next, v_t, decay_t);
+    }
+
+    cublasSetStream(blas_handle, save_stream);
+}
+
+template<typename T>
+struct BackwardPass<T>::private_data {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    cublasHandle_t blas_handle;
+    cudaStream_t stream;
+};
+
+template<typename T>
+BackwardPass<T>::BackwardPass(
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const cublasHandle_t& blas_handle,
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->blas_handle = blas_handle;
+    data_->stream = stream;
+}
+
+template<typename T>
+BackwardPass<T>::~BackwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void BackwardPass<T>::Run(
+    const int steps,
+    const T* R,              // [D, D]
+    const T* h,              // [(T+1)*B, D]
+    const T* v,              // [T*B, D]
+    const T* delta_raw,      // [T*B, D]
+    const T* decay_cache,    // [T*B, D]
+    const T* dh_new,         // [(T+1)*B, D]
+    T* dx,                   // [T*B, D]
+    T* dh,                   // [B, D] - gradient to pass back
+    T* dR,                   // [D, D]
+    T* db,                   // [D]
+    T* d_delta_raw,          // [T*B, D]
+    T* tmp_dRh               // [B, D]
+) {
+    static const T alpha = static_cast<T>(1.0);
+    static const T beta_zero = static_cast<T>(0.0);
+    static const T beta_one = static_cast<T>(1.0);
+
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+
+    cudaStream_t stream = data_->stream;
+    cublasHandle_t blas_handle = data_->blas_handle;
+
+    cudaStream_t save_stream;
+    cublasGetStream(blas_handle, &save_stream);
+    cublasSetStream(blas_handle, stream);
+
+    // Initialize dh to zero
+    cudaMemsetAsync(dh, 0, BD * sizeof(T), stream);
+
+    const int threads = 256;
+    const int blocks = (BD + threads - 1) / threads;
+
+    for (int t = steps - 1; t >= 0; --t) {
+        const T* h_t = h + t * BD;
+        const T* v_t = v + t * BD;
+        const T* delta_raw_t = delta_raw + t * BD;
+        const T* decay_t = decay_cache + t * BD;
+        const T* dh_out_t = dh_new + (t + 1) * BD;
+        T* dx_t = dx + t * BD;
+        T* d_delta_raw_t = d_delta_raw + t * BD;
+
+        // Pointwise backward
+        ElmanLeakyMamba2DeltaBackwardPointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, dh_out_t, dh, v_t, delta_raw_t, decay_t, h_t,
+            tmp_dRh, d_delta_raw_t, dh);
+
+        // dx = Wx^T @ d_raw (but Wx is identity in our case, so dx = d_raw)
+        // Actually for this kernel, we need to accumulate into dx
+        cudaMemcpyAsync(dx_t, tmp_dRh, BD * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+
+        // db += sum(d_raw, dim=0)
+        const int bias_threads = 256;
+        const int bias_blocks = (D + bias_threads - 1) / bias_threads;
+        AccumulateBiasGradientKernel<T><<<bias_blocks, bias_threads, 0, stream>>>(
+            batch_size, D, tmp_dRh, db);
+
+        // dR += h_t^T @ d_raw
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            D, D, batch_size,
+            &alpha,
+            tmp_dRh, D,
+            h_t, D,
+            &beta_one,
+            dR, D);
+
+        // dh += R^T @ d_raw (from matmul R @ h)
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            D, batch_size, D,
+            &alpha,
+            R, D,
+            tmp_dRh, D,
+            &beta_one,
+            dh, D);
+    }
+
+    cublasSetStream(blas_handle, save_stream);
+}
+
+template struct ForwardPass<float>;
+template struct ForwardPass<double>;
+template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
+template struct BackwardPass<float>;
+template struct BackwardPass<double>;
+template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
+
+}  // namespace elman_leaky_mamba2_delta
+
+// ============================================================================
+// ElmanNoDelta Implementation (FIXED decay, no input-dependent delta)
+// ============================================================================
+// Simplified version of ElmanLeaky with constant alpha:
+// - candidate = tanh(R @ h + Wx @ x + b)
+// - h_new = alpha * h + (1 - alpha) * candidate  -- FIXED alpha!
+// This tests whether input-dependent delta is actually needed.
+namespace elman_no_delta {
+
+namespace {
+
+template<typename T>
+__global__
+void ElmanNoDeltaPointwiseKernel(
+    const int batch_size,
+    const int D,
+    const float alpha,              // SCALAR fixed decay factor
+    const T* __restrict__ Rh,       // [B, D] - R @ h_prev
+    const T* __restrict__ Wx,       // [B, D]
+    const T* __restrict__ b,        // [D]
+    const T* __restrict__ h_prev,   // [B, D] - previous hidden state
+    T* __restrict__ h_next,         // [B, D] - output
+    T* __restrict__ v               // [B, D] - save pre-activation
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    float raw = static_cast<float>(Rh[idx]) +
+                static_cast<float>(Wx[idx]) +
+                static_cast<float>(b[idx % D]);
+
+    float candidate = tanhf(raw);
+    float h_p = static_cast<float>(h_prev[idx]);
+
+    // Fixed alpha leaky integration: h_new = alpha * h_prev + (1 - alpha) * candidate
+    float h_new = alpha * h_p + (1.0f - alpha) * candidate;
+
+    h_next[idx] = static_cast<T>(h_new);
+    v[idx] = static_cast<T>(raw);  // Save pre-activation for backward
+}
+
+template<typename T>
+__global__
+void ElmanNoDeltaBackwardPointwiseKernel(
+    const int batch_size,
+    const int D,
+    const float alpha,                    // SCALAR fixed decay factor
+    const T* __restrict__ dh_out,         // [B, D] - gradient from output
+    const T* __restrict__ dh_recurrent,   // [B, D] - gradient from next timestep (or nullptr)
+    const T* __restrict__ v,              // [B, D] - pre-activation (raw)
+    T* __restrict__ d_raw,                // [B, D] - gradient w.r.t. pre-activation
+    T* __restrict__ dh_prev_out           // [B, D] - gradient w.r.t. h_prev (from leaky)
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    const float raw = static_cast<float>(v[idx]);
+    const float candidate = tanhf(raw);
+
+    float dh = static_cast<float>(dh_out[idx]);
+    if (dh_recurrent != nullptr) {
+        dh += static_cast<float>(dh_recurrent[idx]);
+    }
+
+    // Backward through: h_new = alpha * h_prev + (1 - alpha) * candidate
+    // d_candidate = dh * (1 - alpha)
+    // d_h_prev = dh * alpha
+    // NO d_delta since alpha is fixed!
+
+    const float d_candidate = dh * (1.0f - alpha);
+    const float d_h_prev = dh * alpha;
+
+    // d/dx tanh(x) = 1 - tanh(x)^2
+    const float d_raw_val = d_candidate * (1.0f - candidate * candidate);
+
+    d_raw[idx] = static_cast<T>(d_raw_val);
+    dh_prev_out[idx] = static_cast<T>(d_h_prev);
+}
+
+}  // anonymous namespace
+
+template<typename T>
+struct ForwardPass<T>::private_data {
+    bool training;
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    float alpha;
+    cublasHandle_t blas_handle;
+    cudaStream_t stream;
+};
+
+template<typename T>
+ForwardPass<T>::ForwardPass(
+    const bool training,
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const float alpha,
+    const cublasHandle_t& blas_handle,
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->training = training;
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->alpha = alpha;
+    data_->blas_handle = blas_handle;
+    data_->stream = stream;
+}
+
+template<typename T>
+ForwardPass<T>::~ForwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void ForwardPass<T>::Run(
+    const int steps,
+    const T* R,        // [D, D]
+    const T* b,        // [D]
+    const T* Wx,       // [T*B, D]
+    T* h,              // [(T+1)*B, D]
+    T* v,              // [T*B, D]
+    T* tmp_Rh          // [B, D]
+) {
+    static const T cublas_alpha = static_cast<T>(1.0);
+    static const T beta = static_cast<T>(0.0);
+
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+    const float alpha = data_->alpha;
+
+    cudaStream_t stream = data_->stream;
+    cublasHandle_t blas_handle = data_->blas_handle;
+
+    cudaStream_t save_stream;
+    cublasGetStream(blas_handle, &save_stream);
+    cublasSetStream(blas_handle, stream);
+
+    for (int t = 0; t < steps; ++t) {
+        const T* h_t = h + t * BD;
+        T* h_next = h + (t + 1) * BD;
+        T* v_t = v + t * BD;
+        const T* Wx_t = Wx + t * BD;
+
+        // GEMM: tmp_Rh = R @ h_t
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            D, batch_size, D,
+            &cublas_alpha,
+            R, D,
+            h_t, D,
+            &beta,
+            tmp_Rh, D);
+
+        const int threads = 256;
+        const int blocks = (BD + threads - 1) / threads;
+
+        ElmanNoDeltaPointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, alpha, tmp_Rh, Wx_t, b, h_t, h_next, v_t);
+    }
+
+    cublasSetStream(blas_handle, save_stream);
+}
+
+template<typename T>
+struct BackwardPass<T>::private_data {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    float alpha;
+    cublasHandle_t blas_handle;
+    cudaStream_t stream;
+};
+
+template<typename T>
+BackwardPass<T>::BackwardPass(
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const float alpha,
+    const cublasHandle_t& blas_handle,
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->alpha = alpha;
+    data_->blas_handle = blas_handle;
+    data_->stream = stream;
+}
+
+template<typename T>
+BackwardPass<T>::~BackwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void BackwardPass<T>::Run(
+    const int steps,
+    const T* R,        // [D, D]
+    const T* h,        // [(T+1)*B, D]
+    const T* v,        // [T*B, D]
+    const T* dh_new,   // [(T+1)*B, D]
+    T* dWx,            // [T*B, D]
+    T* dR,             // [D, D]
+    T* db,             // [D]
+    T* dh,             // [B, D] - recurrent gradient
+    T* tmp_dRh         // [B, D]
+) {
+    static const T cublas_alpha = static_cast<T>(1.0);
+    static const T beta_zero = static_cast<T>(0.0);
+    static const T beta_one = static_cast<T>(1.0);
+
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+    const float alpha = data_->alpha;
+
+    cudaStream_t stream = data_->stream;
+    cublasHandle_t blas_handle = data_->blas_handle;
+
+    cudaStream_t save_stream;
+    cublasGetStream(blas_handle, &save_stream);
+    cublasSetStream(blas_handle, stream);
+
+    const int threads = 256;
+    const int blocks = (BD + threads - 1) / threads;
+
+    // Backward through time
+    for (int t = steps - 1; t >= 0; --t) {
+        const T* dh_out = dh_new + (t + 1) * BD;
+        const T* v_t = v + t * BD;
+        const T* h_t = h + t * BD;
+        T* dWx_t = dWx + t * BD;
+
+        const T* dh_recurrent = (t == steps - 1) ? nullptr : dh;
+
+        ElmanNoDeltaBackwardPointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, alpha, dh_out, dh_recurrent, v_t,
+            tmp_dRh, dh);
+
+        // dWx_t = d_raw (gradient w.r.t. Wx @ x contribution)
+        cudaMemcpyAsync(dWx_t, tmp_dRh, BD * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+
+        // Accumulate db: db += sum(d_raw, dim=0) using kernel
+        const int bias_threads = 256;
+        const int bias_blocks = (D + bias_threads - 1) / bias_threads;
+        AccumulateBiasGradientKernel<T><<<bias_blocks, bias_threads, 0, stream>>>(
+            batch_size, D, tmp_dRh, db);
+
+        // Accumulate dR: dR += h_t^T @ d_raw = [D, B] @ [B, D] = [D, D]
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            D, D, batch_size,
+            &cublas_alpha,
+            h_t, D,
+            tmp_dRh, D,
+            &beta_one,
+            dR, D);
+
+        // dh = R @ d_raw (gradient from R @ h term)
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            D, batch_size, D,
+            &cublas_alpha,
+            R, D,
+            tmp_dRh, D,
+            &beta_zero,
+            dh, D);
+    }
+
+    cublasSetStream(blas_handle, save_stream);
+}
+
+template struct ForwardPass<float>;
+template struct ForwardPass<double>;
+template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
+template struct BackwardPass<float>;
+template struct BackwardPass<double>;
+template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
+
+}  // namespace elman_no_delta
+
+// ============================================================================
+// ElmanMamba2 Implementation (Mamba2-style linear recurrence)
+// ============================================================================
+// Mamba2-style discretization with NO R matrix and NO tanh:
+// - delta = softplus(W_delta @ x + b_delta)      -- always positive
+// - decay = exp(-delta)                          -- between 0 and 1
+// - Bx = B @ x + b_B                            -- input projection
+// - h_new = decay * h + (1 - decay) * Bx        -- linear combination
+// Key: No R matrix means no recurrent GEMM! Much faster than standard Elman.
+namespace elman_mamba2 {
+
+namespace {
+
+__device__ __forceinline__
+float device_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__
+float device_softplus(float x) {
+    // softplus(x) = log(1 + exp(x))
+    // Numerically stable version
+    if (x > 20.0f) return x;
+    return logf(1.0f + expf(x));
+}
+
+// Broadcast bias [D] to [B, D]
+template<typename T>
+__global__
+void BroadcastBiasKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ bias,  // [D]
+    T* __restrict__ out          // [B, D]
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+    if (idx >= total) return;
+    out[idx] = bias[idx % D];
+}
+
+template<typename T>
+__global__
+void ElmanMamba2PointwiseKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ Wx_delta,  // [B, D] - W_delta @ x + b_delta
+    const T* __restrict__ Bx,         // [B, D] - B @ x + b_B
+    const T* __restrict__ h_prev,     // [B, D] - previous hidden state
+    T* __restrict__ h_next,           // [B, D] - output
+    T* __restrict__ v                 // [B, D] - save Wx_delta for backward
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    float wx_d = static_cast<float>(Wx_delta[idx]);
+    float bx = static_cast<float>(Bx[idx]);
+    float h_p = static_cast<float>(h_prev[idx]);
+
+    // Mamba2 formula: delta = softplus(Wx_delta), decay = exp(-delta)
+    float delta = device_softplus(wx_d);
+    float decay = expf(-delta);
+
+    // h_new = decay * h + (1 - decay) * Bx
+    float h_new = decay * h_p + (1.0f - decay) * bx;
+
+    h_next[idx] = static_cast<T>(h_new);
+    v[idx] = static_cast<T>(wx_d);  // Save for backward
+}
+
+template<typename T>
+__global__
+void ElmanMamba2BackwardPointwiseKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ dh_out,       // [B, D] - gradient from output
+    const T* __restrict__ dh_recurrent, // [B, D] - gradient from next timestep (or nullptr)
+    const T* __restrict__ v,            // [B, D] - saved Wx_delta
+    const T* __restrict__ Bx,           // [B, D] - saved Bx
+    const T* __restrict__ h_prev,       // [B, D] - previous hidden state
+    T* __restrict__ d_Wx_delta,         // [B, D] - gradient w.r.t. W_delta projection
+    T* __restrict__ d_Bx,               // [B, D] - gradient w.r.t. B projection
+    T* __restrict__ dh_prev_out         // [B, D] - gradient w.r.t. h_prev
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    const float wx_d = static_cast<float>(v[idx]);
+    const float bx = static_cast<float>(Bx[idx]);
+    const float h_p = static_cast<float>(h_prev[idx]);
+
+    float dh = static_cast<float>(dh_out[idx]);
+    if (dh_recurrent != nullptr) {
+        dh += static_cast<float>(dh_recurrent[idx]);
+    }
+
+    // Recompute forward values
+    float delta = device_softplus(wx_d);
+    float decay = expf(-delta);
+
+    // Backward through: h_new = decay * h_prev + (1 - decay) * Bx
+    float d_decay = dh * (h_p - bx);       // d/d(decay)
+    float d_bx = dh * (1.0f - decay);      // d/d(Bx)
+    float d_h_prev = dh * decay;           // d/d(h_prev)
+
+    // d/dx exp(-softplus(x)) = exp(-softplus(x)) * (-sigmoid(x))
+    //                        = decay * (-sigmoid(x))
+    float d_delta = d_decay * (-decay);
+    float d_wx_delta = d_delta * device_sigmoid(wx_d);  // d/dx softplus(x) = sigmoid(x)
+
+    d_Wx_delta[idx] = static_cast<T>(d_wx_delta);
+    d_Bx[idx] = static_cast<T>(d_bx);
+    dh_prev_out[idx] = static_cast<T>(d_h_prev);
+}
+
+}  // anonymous namespace
+
+template<typename T>
+struct ForwardPass<T>::private_data {
+    bool training;
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    cublasHandle_t blas_handle;
+    cudaStream_t stream;
+};
+
+template<typename T>
+ForwardPass<T>::ForwardPass(
+    const bool training,
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const cublasHandle_t& blas_handle,
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->training = training;
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->blas_handle = blas_handle;
+    data_->stream = stream;
+}
+
+template<typename T>
+ForwardPass<T>::~ForwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void ForwardPass<T>::Run(
+    const int steps,
+    const T* W_delta,    // [D, D] - delta projection weights
+    const T* b_delta,    // [D] - delta projection bias
+    const T* W_B,        // [D, D] - B projection weights
+    const T* b_B,        // [D] - B projection bias
+    const T* x,          // [T, B, D] - input sequence
+    T* h,                // [T+1, B, D] - hidden states (h[0] = h0)
+    T* Wx_delta_cache,   // [T, B, D] - cached Wx_delta for backward
+    T* Bx_cache,         // [T, B, D] - cached Bx for backward
+    T* tmp_Wx_delta,     // [B, D] - workspace
+    T* tmp_Bx) {         // [B, D] - workspace
+
+    static const T alpha = static_cast<T>(1.0);
+    static const T beta_zero = static_cast<T>(0.0);
+    static const T beta_one = static_cast<T>(1.0);
+
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+
+    cudaStream_t stream = data_->stream;
+    cublasHandle_t blas_handle = data_->blas_handle;
+
+    cudaStream_t save_stream;
+    cublasGetStream(blas_handle, &save_stream);
+    cublasSetStream(blas_handle, stream);
+
+    const int threads = 256;
+    const int blocks = (BD + threads - 1) / threads;
+
+    for (int t = 0; t < steps; ++t) {
+        const T* x_t = x + t * BD;
+        const T* h_t = h + t * BD;
+        T* h_next = h + (t + 1) * BD;
+        T* Wx_delta_t = Wx_delta_cache + t * BD;
+        T* Bx_t = Bx_cache + t * BD;
+
+        // Compute Wx_delta = W_delta @ x + b_delta
+        // First broadcast bias to tmp_Wx_delta
+        BroadcastBiasKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, b_delta, tmp_Wx_delta);
+
+        // Then GEMM: tmp_Wx_delta += W_delta @ x
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            D, batch_size, D,
+            &alpha,
+            W_delta, D,
+            x_t, D,
+            &beta_one,
+            tmp_Wx_delta, D);
+
+        // Compute Bx = W_B @ x + b_B
+        BroadcastBiasKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, b_B, tmp_Bx);
+
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            D, batch_size, D,
+            &alpha,
+            W_B, D,
+            x_t, D,
+            &beta_one,
+            tmp_Bx, D);
+
+        // Cache for backward
+        cudaMemcpyAsync(Wx_delta_t, tmp_Wx_delta, BD * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(Bx_t, tmp_Bx, BD * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+
+        // Pointwise kernel: h_next = decay * h_t + (1 - decay) * Bx
+        ElmanMamba2PointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, tmp_Wx_delta, tmp_Bx, h_t,
+            h_next, Wx_delta_t);  // v = Wx_delta for backward (overwrites cache with same value)
+    }
+
+    cublasSetStream(blas_handle, save_stream);
+}
+
+template<typename T>
+struct BackwardPass<T>::private_data {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    cublasHandle_t blas_handle;
+    cudaStream_t stream;
+};
+
+template<typename T>
+BackwardPass<T>::BackwardPass(
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const cublasHandle_t& blas_handle,
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->blas_handle = blas_handle;
+    data_->stream = stream;
+}
+
+template<typename T>
+BackwardPass<T>::~BackwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void BackwardPass<T>::Run(
+    const int steps,
+    const T* W_delta,      // [D, D]
+    const T* W_B,          // [D, D]
+    const T* x,            // [T, B, D]
+    const T* h,            // [T+1, B, D]
+    const T* Wx_delta_cache, // [T, B, D] - saved Wx_delta
+    const T* Bx_cache,     // [T, B, D] - saved Bx
+    const T* dh_new,       // [T+1, B, D] - gradient w.r.t. output
+    T* dx,                 // [T, B, D] - gradient w.r.t. input
+    T* dW_delta,           // [D, D] - gradient w.r.t. W_delta
+    T* db_delta,           // [D] - gradient w.r.t. b_delta
+    T* dW_B,               // [D, D] - gradient w.r.t. W_B
+    T* db_B,               // [D] - gradient w.r.t. b_B
+    T* dh,                 // [B, D] - gradient w.r.t. h (carried through time)
+    T* tmp_d_Wx_delta,     // [B, D] - workspace
+    T* tmp_d_Bx) {         // [B, D] - workspace
+
+    static const T cublas_alpha = static_cast<T>(1.0);
+    static const T beta_zero = static_cast<T>(0.0);
+    static const T beta_one = static_cast<T>(1.0);
+
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+
+    cudaStream_t stream = data_->stream;
+    cublasHandle_t blas_handle = data_->blas_handle;
+
+    cudaStream_t save_stream;
+    cublasGetStream(blas_handle, &save_stream);
+    cublasSetStream(blas_handle, stream);
+
+    const int threads = 256;
+    const int blocks = (BD + threads - 1) / threads;
+
+    // Backward through time
+    for (int t = steps - 1; t >= 0; --t) {
+        const T* dh_out = dh_new + (t + 1) * BD;
+        const T* Wx_delta_t = Wx_delta_cache + t * BD;
+        const T* Bx_t = Bx_cache + t * BD;
+        const T* h_t = h + t * BD;
+        const T* x_t = x + t * BD;
+        T* dx_t = dx + t * BD;
+
+        const T* dh_recurrent = (t == steps - 1) ? nullptr : dh;
+
+        // Pointwise backward
+        ElmanMamba2BackwardPointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, dh_out, dh_recurrent, Wx_delta_t, Bx_t, h_t,
+            tmp_d_Wx_delta, tmp_d_Bx, dh);
+
+        // Accumulate db_delta += sum(d_Wx_delta, dim=0)
+        const int bias_threads = 256;
+        const int bias_blocks = (D + bias_threads - 1) / bias_threads;
+        AccumulateBiasGradientKernel<T><<<bias_blocks, bias_threads, 0, stream>>>(
+            batch_size, D, tmp_d_Wx_delta, db_delta);
+
+        // Accumulate db_B += sum(d_Bx, dim=0)
+        AccumulateBiasGradientKernel<T><<<bias_blocks, bias_threads, 0, stream>>>(
+            batch_size, D, tmp_d_Bx, db_B);
+
+        // Accumulate dW_delta += x_t^T @ d_Wx_delta = [D, B] @ [B, D] = [D, D]
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            D, D, batch_size,
+            &cublas_alpha,
+            x_t, D,
+            tmp_d_Wx_delta, D,
+            &beta_one,
+            dW_delta, D);
+
+        // Accumulate dW_B += x_t^T @ d_Bx
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            D, D, batch_size,
+            &cublas_alpha,
+            x_t, D,
+            tmp_d_Bx, D,
+            &beta_one,
+            dW_B, D);
+
+        // dx = W_delta^T @ d_Wx_delta + W_B^T @ d_Bx
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            D, batch_size, D,
+            &cublas_alpha,
+            W_delta, D,
+            tmp_d_Wx_delta, D,
+            &beta_zero,
+            dx_t, D);
+
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            D, batch_size, D,
+            &cublas_alpha,
+            W_B, D,
+            tmp_d_Bx, D,
+            &beta_one,
+            dx_t, D);
+    }
+
+    cublasSetStream(blas_handle, save_stream);
+}
+
+template struct ForwardPass<float>;
+template struct ForwardPass<double>;
+template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
+template struct BackwardPass<float>;
+template struct BackwardPass<double>;
+template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
+
+}  // namespace elman_mamba2
+
+// ============================================================================
+// ElmanMamba2Silu Implementation (Mamba2 structure + silu nonlinearity)
+// ============================================================================
+// Like elman_mamba2 but with silu(Bx) instead of just Bx:
+// - delta = softplus(W_delta @ x + b_delta)  -- input-dependent discretization
+// - decay = exp(-delta)                      -- between 0 and 1
+// - candidate = silu(B @ x + b_B)            -- silu nonlinearity (unbounded for x>0)
+// - h_new = decay * h + (1 - decay) * candidate
+//
+// Testing if silu (unbounded) works better than tanh (bounded) in Mamba2 structure.
+namespace elman_mamba2_silu {
+
+namespace {
+
+__device__ __forceinline__
+float device_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__
+float device_softplus(float x) {
+    if (x > 20.0f) return x;
+    return logf(1.0f + expf(x));
+}
+
+__device__ __forceinline__
+float device_silu(float x) {
+    return x * device_sigmoid(x);
+}
+
+__device__ __forceinline__
+float d_silu(float x, float sig) {
+    // d/dx silu(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+    return sig * (1.0f + x * (1.0f - sig));
+}
+
+template<typename T>
+__global__
+void BroadcastBiasKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ bias,
+    T* __restrict__ out
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+    if (idx >= total) return;
+    out[idx] = bias[idx % D];
+}
+
+template<typename T>
+__global__
+void ElmanMamba2SiluPointwiseKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ Wx_delta,  // [B, D] - W_delta @ x + b_delta
+    const T* __restrict__ Bx,         // [B, D] - B @ x + b_B
+    const T* __restrict__ h_prev,     // [B, D] - previous hidden state
+    T* __restrict__ h_next,           // [B, D] - output
+    T* __restrict__ v                 // [B, D] - save Wx_delta for backward
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    float wx_d = static_cast<float>(Wx_delta[idx]);
+    float bx = static_cast<float>(Bx[idx]);
+    float h_p = static_cast<float>(h_prev[idx]);
+
+    // Mamba2 formula with silu: delta = softplus(Wx_delta), decay = exp(-delta)
+    float delta = device_softplus(wx_d);
+    float decay = expf(-delta);
+
+    // candidate = silu(Bx) instead of just Bx
+    float candidate = device_silu(bx);
+
+    // h_new = decay * h + (1 - decay) * candidate
+    float h_new = decay * h_p + (1.0f - decay) * candidate;
+
+    h_next[idx] = static_cast<T>(h_new);
+    v[idx] = static_cast<T>(wx_d);  // Save for backward
+}
+
+template<typename T>
+__global__
+void ElmanMamba2SiluBackwardPointwiseKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ dh_out,       // [B, D] - gradient from output
+    const T* __restrict__ dh_recurrent, // [B, D] - gradient from next timestep (or nullptr)
+    const T* __restrict__ v,            // [B, D] - saved Wx_delta
+    const T* __restrict__ Bx,           // [B, D] - saved Bx
+    const T* __restrict__ h_prev,       // [B, D] - previous hidden state
+    T* __restrict__ d_Wx_delta,         // [B, D] - gradient w.r.t. W_delta projection
+    T* __restrict__ d_Bx,               // [B, D] - gradient w.r.t. B projection
+    T* __restrict__ dh_prev_out         // [B, D] - gradient w.r.t. h_prev
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    float dh = static_cast<float>(dh_out[idx]);
+    if (dh_recurrent != nullptr) {
+        dh += static_cast<float>(dh_recurrent[idx]);
+    }
+
+    float wx_d = static_cast<float>(v[idx]);
+    float bx = static_cast<float>(Bx[idx]);
+    float h_p = static_cast<float>(h_prev[idx]);
+
+    // Recompute forward values
+    float delta = device_softplus(wx_d);
+    float decay = expf(-delta);
+    float sig_bx = device_sigmoid(bx);
+    float candidate = bx * sig_bx;  // silu(bx)
+
+    // Backward through: h_new = decay * h_p + (1 - decay) * candidate
+    float d_decay = dh * (h_p - candidate);
+    float d_candidate = dh * (1.0f - decay);
+    float d_h_prev = dh * decay;
+
+    // Backward through silu: d_bx = d_candidate * d_silu(bx)
+    float d_bx = d_candidate * d_silu(bx, sig_bx);
+
+    // Backward through decay = exp(-delta): d_delta = d_decay * (-decay)
+    float d_delta = d_decay * (-decay);
+
+    // Backward through delta = softplus(wx_d): d_wx_delta = d_delta * sigmoid(wx_d)
+    float d_wx_delta = d_delta * device_sigmoid(wx_d);
+
+    d_Wx_delta[idx] = static_cast<T>(d_wx_delta);
+    d_Bx[idx] = static_cast<T>(d_bx);
+    dh_prev_out[idx] = static_cast<T>(d_h_prev);
+}
+
+}  // anonymous namespace
+
+template<typename T>
+struct ForwardPass<T>::private_data {
+    bool training;
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    cublasHandle_t blas_handle;
+    cudaStream_t stream;
+};
+
+template<typename T>
+ForwardPass<T>::ForwardPass(
+    const bool training,
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const cublasHandle_t& blas_handle,
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->training = training;
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->blas_handle = blas_handle;
+    data_->stream = stream;
+}
+
+template<typename T>
+ForwardPass<T>::~ForwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void ForwardPass<T>::Run(
+    const int steps,
+    const T* W_delta,    // [D, D] - delta projection weights
+    const T* b_delta,    // [D] - delta projection bias
+    const T* W_B,        // [D, D] - B projection weights
+    const T* b_B,        // [D] - B projection bias
+    const T* x,          // [T, B, D] - input sequence
+    T* h,                // [T+1, B, D] - hidden states (h[0] = h0)
+    T* Wx_delta_cache,   // [T, B, D] - cached Wx_delta for backward
+    T* Bx_cache,         // [T, B, D] - cached Bx for backward
+    T* tmp_Wx_delta,     // [B, D] - workspace
+    T* tmp_Bx) {         // [B, D] - workspace
+
+    static const T alpha = static_cast<T>(1.0);
+    static const T beta_zero = static_cast<T>(0.0);
+    static const T beta_one = static_cast<T>(1.0);
+
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+
+    cudaStream_t stream = data_->stream;
+    cublasHandle_t blas_handle = data_->blas_handle;
+
+    cudaStream_t save_stream;
+    cublasGetStream(blas_handle, &save_stream);
+    cublasSetStream(blas_handle, stream);
+
+    const int threads = 256;
+    const int blocks = (BD + threads - 1) / threads;
+
+    for (int t = 0; t < steps; ++t) {
+        const T* x_t = x + t * BD;
+        const T* h_t = h + t * BD;
+        T* h_next = h + (t + 1) * BD;
+        T* Wx_delta_t = Wx_delta_cache + t * BD;
+        T* Bx_t = Bx_cache + t * BD;
+
+        // Compute Wx_delta = W_delta @ x + b_delta
+        BroadcastBiasKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, b_delta, tmp_Wx_delta);
+
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            D, batch_size, D,
+            &alpha,
+            W_delta, D,
+            x_t, D,
+            &beta_one,
+            tmp_Wx_delta, D);
+
+        // Compute Bx = W_B @ x + b_B
+        BroadcastBiasKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, b_B, tmp_Bx);
+
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            D, batch_size, D,
+            &alpha,
+            W_B, D,
+            x_t, D,
+            &beta_one,
+            tmp_Bx, D);
+
+        // Cache for backward
+        cudaMemcpyAsync(Wx_delta_t, tmp_Wx_delta, BD * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(Bx_t, tmp_Bx, BD * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+
+        // Pointwise kernel: h_next = decay * h_t + (1 - decay) * silu(Bx)
+        ElmanMamba2SiluPointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, tmp_Wx_delta, tmp_Bx, h_t,
+            h_next, Wx_delta_t);
+    }
+
+    cublasSetStream(blas_handle, save_stream);
+}
+
+template<typename T>
+struct BackwardPass<T>::private_data {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    cublasHandle_t blas_handle;
+    cudaStream_t stream;
+};
+
+template<typename T>
+BackwardPass<T>::BackwardPass(
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const cublasHandle_t& blas_handle,
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->blas_handle = blas_handle;
+    data_->stream = stream;
+}
+
+template<typename T>
+BackwardPass<T>::~BackwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void BackwardPass<T>::Run(
+    const int steps,
+    const T* W_delta,      // [D, D]
+    const T* W_B,          // [D, D]
+    const T* x,            // [T, B, D]
+    const T* h,            // [T+1, B, D]
+    const T* Wx_delta_cache, // [T, B, D] - saved Wx_delta
+    const T* Bx_cache,     // [T, B, D] - saved Bx
+    const T* dh_new,       // [T+1, B, D] - gradient w.r.t. output
+    T* dx,                 // [T, B, D] - gradient w.r.t. input
+    T* dW_delta,           // [D, D] - gradient w.r.t. W_delta
+    T* db_delta,           // [D] - gradient w.r.t. b_delta
+    T* dW_B,               // [D, D] - gradient w.r.t. W_B
+    T* db_B,               // [D] - gradient w.r.t. b_B
+    T* dh,                 // [B, D] - gradient w.r.t. h (carried through time)
+    T* tmp_d_Wx_delta,     // [B, D] - workspace
+    T* tmp_d_Bx) {         // [B, D] - workspace
+
+    static const T cublas_alpha = static_cast<T>(1.0);
+    static const T beta_zero = static_cast<T>(0.0);
+    static const T beta_one = static_cast<T>(1.0);
+
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+
+    cudaStream_t stream = data_->stream;
+    cublasHandle_t blas_handle = data_->blas_handle;
+
+    cudaStream_t save_stream;
+    cublasGetStream(blas_handle, &save_stream);
+    cublasSetStream(blas_handle, stream);
+
+    const int threads = 256;
+    const int blocks = (BD + threads - 1) / threads;
+
+    cudaMemsetAsync(dh, 0, BD * sizeof(T), stream);
+
+    for (int t = steps - 1; t >= 0; --t) {
+        const T* x_t = x + t * BD;
+        const T* h_prev_t = h + t * BD;
+        const T* v_t = Wx_delta_cache + t * BD;
+        const T* Bx_t = Bx_cache + t * BD;
+        const T* dh_t = dh_new + (t + 1) * BD;
+        T* dx_t = dx + t * BD;
+
+        // Pointwise backward
+        ElmanMamba2SiluBackwardPointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D,
+            dh_t,
+            (t == steps - 1) ? nullptr : dh,
+            v_t,
+            Bx_t,
+            h_prev_t,
+            tmp_d_Wx_delta,
+            tmp_d_Bx,
+            dh);
+
+        // Accumulate gradients for W_delta: dW_delta += d_Wx_delta @ x^T
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            D, D, batch_size,
+            &cublas_alpha,
+            tmp_d_Wx_delta, D,
+            x_t, D,
+            &beta_one,
+            dW_delta, D);
+
+        // Accumulate db_delta += sum(d_Wx_delta, dim=0)
+        const int bias_threads = 256;
+        const int bias_blocks = (D + bias_threads - 1) / bias_threads;
+        AccumulateBiasGradientKernel<T><<<bias_blocks, bias_threads, 0, stream>>>(
+            batch_size, D, tmp_d_Wx_delta, db_delta);
+
+        // Accumulate gradients for W_B: dW_B += d_Bx @ x^T
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            D, D, batch_size,
+            &cublas_alpha,
+            tmp_d_Bx, D,
+            x_t, D,
+            &beta_one,
+            dW_B, D);
+
+        // Accumulate db_B += sum(d_Bx, dim=0)
+        AccumulateBiasGradientKernel<T><<<bias_blocks, bias_threads, 0, stream>>>(
+            batch_size, D, tmp_d_Bx, db_B);
+
+        // dx = W_delta^T @ d_Wx_delta + W_B^T @ d_Bx
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            D, batch_size, D,
+            &cublas_alpha,
+            W_delta, D,
+            tmp_d_Wx_delta, D,
+            &beta_zero,
+            dx_t, D);
+
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            D, batch_size, D,
+            &cublas_alpha,
+            W_B, D,
+            tmp_d_Bx, D,
+            &beta_one,
+            dx_t, D);
+    }
+
+    cublasSetStream(blas_handle, save_stream);
+}
+
+template struct ForwardPass<float>;
+template struct ForwardPass<double>;
+template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
+template struct BackwardPass<float>;
+template struct BackwardPass<double>;
+template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
+
+}  // namespace elman_mamba2_silu
+
+// ============================================================================
 // ElmanLeakySilu Implementation (silu activation + leaky integration)
 // ============================================================================
 // Same as ElmanLeaky but with silu instead of tanh:
@@ -2136,6 +3533,300 @@ template struct BackwardPass<__half>;
 template struct BackwardPass<__nv_bfloat16>;
 
 }  // namespace elman_leaky_silu
+
+// ============================================================================
+// ElmanLeakyDiag Implementation (diagonal R - like Mamba's diagonal A!)
+// ============================================================================
+// Same as ElmanLeaky but with DIAGONAL R instead of full matrix:
+// - candidate = tanh(r ⊙ h + Wx @ x + b)           -- r is [D] not [D,D]!
+// - delta = sigmoid(W_delta @ x + b_delta)         -- input-dependent blend
+// - h_new = (1 - delta) * h + delta * candidate    -- leaky integration
+//
+// Benefits:
+// - D params instead of D² for recurrence (massive reduction!)
+// - No GEMM needed - pure elementwise ops (faster!)
+// - Cross-channel mixing happens via W @ x (input projection)
+// - Matches Mamba's diagonal A architecture
+namespace elman_leaky_diag {
+
+namespace {
+
+template<typename T>
+__global__
+void ElmanLeakyDiagPointwiseKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ r,       // [D] - diagonal recurrence weights
+    const T* __restrict__ h_prev,  // [B, D] - previous hidden state
+    const T* __restrict__ Wx,      // [B, D]
+    const T* __restrict__ b,       // [D]
+    const T* __restrict__ delta,   // [B, D] - precomputed delta
+    T* __restrict__ h_next,        // [B, D] - output
+    T* __restrict__ v              // [B, D] - save pre-activation
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    const int d = idx % D;  // which dimension
+
+    // raw = r[d] * h[idx] + Wx[idx] + b[d]  -- diagonal R!
+    float raw = static_cast<float>(r[d]) * static_cast<float>(h_prev[idx]) +
+                static_cast<float>(Wx[idx]) +
+                static_cast<float>(b[d]);
+
+    float candidate = tanhf(raw);
+    float d_val = static_cast<float>(delta[idx]);
+    float h_p = static_cast<float>(h_prev[idx]);
+
+    // Leaky integration: h_new = (1 - delta) * h_prev + delta * candidate
+    float h_new = (1.0f - d_val) * h_p + d_val * candidate;
+
+    h_next[idx] = static_cast<T>(h_new);
+    v[idx] = static_cast<T>(raw);  // Save pre-activation for backward
+}
+
+template<typename T>
+__global__
+void ElmanLeakyDiagBackwardPointwiseKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ r,            // [D] - diagonal recurrence weights
+    const T* __restrict__ dh_out,       // [B, D] - gradient from output
+    const T* __restrict__ dh_recurrent, // [B, D] - gradient from next timestep (or nullptr)
+    const T* __restrict__ v,            // [B, D] - pre-activation (raw)
+    const T* __restrict__ delta,        // [B, D] - delta used in forward
+    const T* __restrict__ h_prev,       // [B, D] - previous hidden state
+    T* __restrict__ d_raw,              // [B, D] - gradient w.r.t. pre-activation
+    T* __restrict__ d_delta,            // [B, D] - gradient w.r.t. delta
+    T* __restrict__ dh_prev_out         // [B, D] - gradient w.r.t. h_prev
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    const int total = batch_size * D;
+
+    if (idx >= total) return;
+
+    const int d = idx % D;
+
+    const float raw = static_cast<float>(v[idx]);
+    const float candidate = tanhf(raw);
+    const float d_val = static_cast<float>(delta[idx]);
+    const float h_p = static_cast<float>(h_prev[idx]);
+    const float r_d = static_cast<float>(r[d]);
+
+    float dh = static_cast<float>(dh_out[idx]);
+    if (dh_recurrent != nullptr) {
+        dh += static_cast<float>(dh_recurrent[idx]);
+    }
+
+    // Backward through: h_new = (1 - d) * h_prev + d * candidate
+    const float d_candidate = dh * d_val;
+    const float d_h_prev_from_leaky = dh * (1.0f - d_val);
+    const float d_d = dh * (candidate - h_p);
+
+    // d/dx tanh(x) = 1 - tanh(x)^2
+    const float d_raw_val = d_candidate * (1.0f - candidate * candidate);
+
+    // Backward through: raw = r[d] * h_prev + Wx + b
+    // dh_prev += r[d] * d_raw (contribution from matmul)
+    const float d_h_prev_from_raw = r_d * d_raw_val;
+
+    d_raw[idx] = static_cast<T>(d_raw_val);
+    d_delta[idx] = static_cast<T>(d_d);
+    dh_prev_out[idx] = static_cast<T>(d_h_prev_from_leaky + d_h_prev_from_raw);
+}
+
+// Reduction kernel for dr gradient
+template<typename T>
+__global__
+void AccumulateDiagGradientKernel(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ h,       // [B, D] - hidden state
+    const T* __restrict__ d_raw,   // [B, D] - gradient w.r.t. pre-activation
+    T* __restrict__ dr             // [D] - accumulated gradient for r
+) {
+    const int d = blockDim.x * blockIdx.x + threadIdx.x;
+    if (d >= D) return;
+
+    // dr[d] += sum over batch of h[b, d] * d_raw[b, d]
+    float sum = 0.0f;
+    for (int b = 0; b < batch_size; ++b) {
+        const int idx = b * D + d;
+        sum += static_cast<float>(h[idx]) * static_cast<float>(d_raw[idx]);
+    }
+    dr[d] = static_cast<T>(static_cast<float>(dr[d]) + sum);
+}
+
+// Bias gradient accumulation (reuse from elman_leaky)
+template<typename T>
+__global__
+void AccumulateBiasGradientKernelDiag(
+    const int batch_size,
+    const int D,
+    const T* __restrict__ d_raw,
+    T* __restrict__ db
+) {
+    const int d = blockDim.x * blockIdx.x + threadIdx.x;
+    if (d >= D) return;
+
+    float sum = 0.0f;
+    for (int b = 0; b < batch_size; ++b) {
+        sum += static_cast<float>(d_raw[b * D + d]);
+    }
+    db[d] = static_cast<T>(static_cast<float>(db[d]) + sum);
+}
+
+}  // anonymous namespace
+
+template<typename T>
+struct ForwardPass<T>::private_data {
+    bool training;
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    cudaStream_t stream;
+};
+
+template<typename T>
+ForwardPass<T>::ForwardPass(
+    const bool training,
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const cublasHandle_t& blas_handle,  // unused but kept for API compatibility
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->training = training;
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->stream = stream;
+}
+
+template<typename T>
+ForwardPass<T>::~ForwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void ForwardPass<T>::Run(
+    const int steps,
+    const T* r,        // [D] - diagonal recurrence weights
+    const T* b,        // [D]
+    const T* Wx,       // [T*B, D]
+    const T* delta,    // [T*B, D]
+    T* h,              // [(T+1)*B, D]
+    T* v               // [T*B, D]
+    // Note: no tmp_Rh needed! Pure elementwise.
+) {
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+    cudaStream_t stream = data_->stream;
+
+    for (int t = 0; t < steps; ++t) {
+        const T* h_t = h + t * BD;
+        T* h_next = h + (t + 1) * BD;
+        T* v_t = v + t * BD;
+        const T* Wx_t = Wx + t * BD;
+        const T* delta_t = delta + t * BD;
+
+        const int threads = 256;
+        const int blocks = (BD + threads - 1) / threads;
+
+        ElmanLeakyDiagPointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, r, h_t, Wx_t, b, delta_t, h_next, v_t);
+    }
+}
+
+template<typename T>
+struct BackwardPass<T>::private_data {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    cudaStream_t stream;
+};
+
+template<typename T>
+BackwardPass<T>::BackwardPass(
+    const int batch_size,
+    const int input_size,
+    const int hidden_size,
+    const cublasHandle_t& blas_handle,  // unused but kept for API compatibility
+    const cudaStream_t& stream) : data_(new private_data) {
+    data_->batch_size = batch_size;
+    data_->input_size = input_size;
+    data_->hidden_size = hidden_size;
+    data_->stream = stream;
+}
+
+template<typename T>
+BackwardPass<T>::~BackwardPass() {
+    delete data_;
+}
+
+template<typename T>
+void BackwardPass<T>::Run(
+    const int steps,
+    const T* r,        // [D] - diagonal recurrence weights
+    const T* h,        // [(T+1)*B, D]
+    const T* v,        // [T*B, D]
+    const T* delta,    // [T*B, D]
+    const T* dh_new,   // [(T+1)*B, D]
+    T* dWx,            // [T*B, D]
+    T* dr,             // [D] - gradient for diagonal r
+    T* db,             // [D]
+    T* d_delta,        // [T*B, D]
+    T* dh              // [B, D] - recurrent gradient
+) {
+    const int batch_size = data_->batch_size;
+    const int D = data_->hidden_size;
+    const int BD = batch_size * D;
+    cudaStream_t stream = data_->stream;
+
+    cudaMemsetAsync(dh, 0, BD * sizeof(T), stream);
+
+    for (int t = steps - 1; t >= 0; --t) {
+        const T* h_t = h + t * BD;
+        const T* v_t = v + t * BD;
+        const T* delta_t = delta + t * BD;
+        T* dWx_t = dWx + t * BD;
+        T* d_delta_t = d_delta + t * BD;
+        const T* dh_out = dh_new + (t + 1) * BD;
+
+        const int threads = 256;
+        const int blocks = (BD + threads - 1) / threads;
+
+        const T* dh_recurrent = (t == steps - 1) ? nullptr : dh;
+
+        // Compute d_raw, d_delta, and full dh_prev (including r*d_raw term)
+        ElmanLeakyDiagBackwardPointwiseKernel<T><<<blocks, threads, 0, stream>>>(
+            batch_size, D, r, dh_out, dh_recurrent, v_t, delta_t, h_t,
+            dWx_t, d_delta_t, dh);  // dWx_t doubles as d_raw storage
+
+        // Accumulate bias gradient
+        const int d_threads = 256;
+        const int d_blocks = (D + d_threads - 1) / d_threads;
+        AccumulateBiasGradientKernelDiag<T><<<d_blocks, d_threads, 0, stream>>>(
+            batch_size, D, dWx_t, db);
+
+        // Accumulate dr gradient: dr[d] += sum_b h[b,d] * d_raw[b,d]
+        AccumulateDiagGradientKernel<T><<<d_blocks, d_threads, 0, stream>>>(
+            batch_size, D, h_t, dWx_t, dr);
+    }
+}
+
+template struct ForwardPass<float>;
+template struct ForwardPass<double>;
+template struct ForwardPass<__half>;
+template struct ForwardPass<__nv_bfloat16>;
+template struct BackwardPass<float>;
+template struct BackwardPass<double>;
+template struct BackwardPass<__half>;
+template struct BackwardPass<__nv_bfloat16>;
+
+}  // namespace elman_leaky_diag
 
 // ============================================================================
 // ElmanLeakySelective Implementation (Mamba2-style discretization + nonlinearity)

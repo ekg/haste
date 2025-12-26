@@ -22,7 +22,7 @@ import torch as _
 from ._version import __version__  # generated in setup.py
 from .elman import Elman
 from .elman_silu import ElmanSilu
-from .elman_variants import ElmanTanh, ElmanSigmoid, ElmanSwish, ElmanGelu, ElmanNoGate
+from .elman_variants import ElmanTanh, ElmanSigmoid, ElmanSwish, ElmanGelu, ElmanNoGate, ElmanMamba2, ElmanMamba2Silu, ElmanLeakyMamba2Delta
 from .gru import GRU
 from .gru_silu import GRU_SiLU
 from .skip_elman import SkipElman
@@ -42,6 +42,9 @@ __all__ = [
     'ElmanSwish',
     'ElmanGelu',
     'ElmanNoGate',
+    'ElmanMamba2',
+    'ElmanMamba2Silu',
+    'ElmanLeakyMamba2Delta',
     'GRU',
     'GRU_SiLU',
     'SkipElman',

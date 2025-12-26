@@ -29,7 +29,10 @@ __all__ = [
     'ElmanGelu',
     'ElmanNoGate',
     'ElmanLeaky',
+    'ElmanNoDelta',
+    'ElmanMamba2',
     'ElmanLeakySilu',
+    'ElmanLeakyDiag',
     'ElmanLeakySelective',
     'LeakyElman',
 ]
@@ -486,6 +489,375 @@ class ElmanLeaky(nn.Module):
 
 
 # ============================================================================
+# ElmanLeakyMamba2Delta: Mamba2-style softplus/exp delta parameterization
+# ============================================================================
+
+class ElmanLeakyMamba2DeltaFunction(Function):
+    @staticmethod
+    def forward(ctx, training, x, h0, Wx, R, bias, delta_raw):
+        # delta_raw: [T, B, D] - raw delta (before softplus!)
+        h, v, decay_cache = lib.elman_leaky_mamba2_delta_forward(
+            training, x, h0, Wx, R, bias, delta_raw)
+
+        if training:
+            ctx.save_for_backward(x, Wx, R, h, v, delta_raw, decay_cache)
+
+        return h[1:]  # Return [T, B, D]
+
+    @staticmethod
+    def backward(ctx, grad_h):
+        x, Wx, R, h, v, delta_raw, decay_cache = ctx.saved_tensors
+
+        B = x.size(1)
+        D = x.size(2)
+        dh_new = torch.zeros(grad_h.size(0) + 1, B, D,
+                           dtype=grad_h.dtype, device=grad_h.device)
+        dh_new[1:] = grad_h
+
+        dx, dh0, dWx, dR, dbias, d_delta_raw = lib.elman_leaky_mamba2_delta_backward(
+            x, Wx, R, h, v, delta_raw, decay_cache, dh_new)
+
+        return None, dx, dh0, dWx, dR, dbias, d_delta_raw
+
+
+class ElmanLeakyMamba2Delta(nn.Module):
+    """
+    Elman RNN with Mamba2-style log-space delta parameterization.
+
+    Architecture:
+        candidate = tanh(R @ h + Wx @ x + b)
+        delta = softplus(W_delta @ x + b_delta)   -- always positive!
+        decay = exp(-delta)                        -- between 0 and 1
+        h_new = decay * h + (1 - decay) * candidate
+
+    Key difference from ElmanLeaky: uses softplus/exp instead of sigmoid.
+    - Wider dynamic range (delta can be 0.001 to 100+)
+    - Better gradients (softplus linear for large values)
+    - More numerically stable (log-space parameterization)
+
+    Args:
+        input_size: Dimension of input features.
+        hidden_size: Dimension of hidden state.
+        delta_init: Initial bias for delta projection (default -1.8).
+                    softplus(-1.8) ≈ 0.15, so exp(-0.15) ≈ 0.86 decay.
+
+    Input shape: [T, B, D] (time-first)
+    Output shape: [T, B, D]
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, delta_init: float = -1.8):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.delta_init = delta_init
+
+        # Main Elman weights
+        self.Wx = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.R = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.bias = nn.Parameter(torch.empty(hidden_size))
+
+        # Delta projection weights (raw delta, before softplus)
+        self.W_delta = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_delta = nn.Parameter(torch.empty(hidden_size))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 1.0 / (self.hidden_size ** 0.5)
+        nn.init.uniform_(self.Wx, -std, std)
+        nn.init.uniform_(self.R, -std, std)
+        nn.init.zeros_(self.bias)
+
+        # Initialize delta projection
+        nn.init.uniform_(self.W_delta, -std * 0.1, std * 0.1)
+        nn.init.constant_(self.b_delta, self.delta_init)
+
+    def forward(self, x, h0=None):
+        T, B, D = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
+
+        # Compute raw delta (before softplus)
+        x_flat = x.reshape(T * B, D)
+        delta_raw = torch.mm(x_flat, self.W_delta.t()) + self.b_delta
+        delta_raw = delta_raw.reshape(T, B, self.hidden_size)
+
+        return ElmanLeakyMamba2DeltaFunction.apply(
+            self.training, x, h0, self.Wx, self.R, self.bias, delta_raw
+        )
+
+
+# ============================================================================
+# ElmanNoDelta: FIXED decay, no input-dependent delta (ablation)
+# ============================================================================
+
+class ElmanNoDeltaFunction(Function):
+    @staticmethod
+    def forward(ctx, training, x, h0, Wx, R, bias, alpha):
+        # alpha: SCALAR fixed decay factor
+        h, v = lib.elman_no_delta_forward(training, x, h0, Wx, R, bias, alpha)
+
+        if training:
+            ctx.save_for_backward(x, Wx, R, h, v)
+            ctx.alpha = alpha
+
+        return h[1:]
+
+    @staticmethod
+    def backward(ctx, grad_h):
+        x, Wx, R, h, v = ctx.saved_tensors
+        alpha = ctx.alpha
+
+        B = x.size(1)
+        D = x.size(2)
+        dh_new = torch.zeros(grad_h.size(0) + 1, B, D,
+                           dtype=grad_h.dtype, device=grad_h.device)
+        dh_new[1:] = grad_h
+
+        dx, dh0, dWx, dR, dbias = lib.elman_no_delta_backward(
+            x, Wx, R, h, v, dh_new, alpha)
+
+        # NO d_delta since alpha is fixed!
+        return None, dx, dh0, dWx, dR, dbias, None
+
+
+class ElmanNoDelta(nn.Module):
+    """
+    Elman RNN with FIXED leaky integration (no input-dependent delta).
+
+    Architecture:
+        candidate = tanh(R @ h + Wx @ x + b)
+        h_new = alpha * h + (1 - alpha) * candidate  -- FIXED alpha!
+
+    This is an ablation of ElmanLeaky to test whether input-dependent delta
+    actually helps. If this performs equally well, we can simplify the model.
+
+    Args:
+        input_size: Dimension of input features.
+        hidden_size: Dimension of hidden state.
+        alpha: Fixed decay factor (how much old state to keep, default 0.88)
+               This corresponds to delta_init=-2 -> sigmoid(-2) ≈ 0.12
+               So alpha = 1 - 0.12 = 0.88
+
+    Input shape: [T, B, D] (time-first)
+    Output shape: [T, B, D]
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, alpha: float = 0.88):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.alpha = alpha  # FIXED, not learned!
+
+        # Main Elman weights (no delta projection!)
+        self.Wx = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.R = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.bias = nn.Parameter(torch.empty(hidden_size))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 1.0 / (self.hidden_size ** 0.5)
+        nn.init.uniform_(self.Wx, -std, std)
+        nn.init.uniform_(self.R, -std, std)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x, h0=None):
+        T, B, D = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
+
+        return ElmanNoDeltaFunction.apply(
+            self.training, x, h0, self.Wx, self.R, self.bias, self.alpha
+        )
+
+
+# ============================================================================
+# ElmanMamba2: Mamba2-style linear recurrence (NO R matrix, NO tanh!)
+# ============================================================================
+
+class ElmanMamba2Function(Function):
+    @staticmethod
+    def forward(ctx, training, x, h0, W_delta, b_delta, W_B, b_B):
+        # x: [T, B, D] input sequence
+        # W_delta, W_B: [D, D] projection weights
+        # b_delta, b_B: [D] projection biases
+        h, Wx_delta_cache, Bx_cache = lib.elman_mamba2_forward(
+            training, x, h0, W_delta, b_delta, W_B, b_B)
+
+        if training:
+            ctx.save_for_backward(x, W_delta, W_B, h, Wx_delta_cache, Bx_cache)
+
+        return h[1:]
+
+    @staticmethod
+    def backward(ctx, grad_h):
+        x, W_delta, W_B, h, Wx_delta_cache, Bx_cache = ctx.saved_tensors
+
+        B = x.size(1)
+        D = x.size(2)
+        dh_new = torch.zeros(grad_h.size(0) + 1, B, D,
+                           dtype=grad_h.dtype, device=grad_h.device)
+        dh_new[1:] = grad_h
+
+        dx, dh0, dW_delta, db_delta, dW_B, db_B = lib.elman_mamba2_backward(
+            x, W_delta, W_B, h, Wx_delta_cache, Bx_cache, dh_new)
+
+        return None, dx, dh0, dW_delta, db_delta, dW_B, db_B
+
+
+class ElmanMamba2(nn.Module):
+    """
+    Mamba2-style linear recurrence with NO R matrix and NO tanh.
+
+    Architecture:
+        delta = softplus(W_delta @ x + b_delta)      -- always positive
+        decay = exp(-delta)                          -- between 0 and 1
+        Bx = W_B @ x + b_B                           -- input projection
+        h_new = decay * h + (1 - decay) * Bx         -- linear combination
+
+    Key differences from standard Elman:
+    - NO R matrix (no recurrent GEMM!)
+    - NO tanh (pure linear combination)
+    - Uses softplus for delta to ensure stability
+
+    This is the Mamba2 architecture without any Elman improvements,
+    used as an ablation baseline.
+
+    Args:
+        input_size: Dimension of input features.
+        hidden_size: Dimension of hidden state.
+        delta_init: Initial bias for delta projection (default -1.8)
+                   softplus(-1.8) ≈ 0.15, exp(-0.15) ≈ 0.86 retention
+
+    Input shape: [T, B, D] (time-first)
+    Output shape: [T, B, D]
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, delta_init: float = -1.8):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.delta_init = delta_init
+
+        # Delta projection: softplus(W_delta @ x + b_delta)
+        self.W_delta = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_delta = nn.Parameter(torch.empty(hidden_size))
+
+        # B projection: W_B @ x + b_B (replaces R @ h in standard Elman!)
+        self.W_B = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_B = nn.Parameter(torch.empty(hidden_size))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 1.0 / (self.hidden_size ** 0.5)
+        nn.init.uniform_(self.W_delta, -std * 0.1, std * 0.1)
+        nn.init.constant_(self.b_delta, self.delta_init)  # softplus(-1.8) ≈ 0.15
+        nn.init.uniform_(self.W_B, -std, std)
+        nn.init.zeros_(self.b_B)
+
+    def forward(self, x, h0=None):
+        T, B, D = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
+
+        return ElmanMamba2Function.apply(
+            self.training, x, h0, self.W_delta, self.b_delta, self.W_B, self.b_B
+        )
+
+
+# ============================================================================
+# ElmanMamba2Silu: Mamba2 structure + silu nonlinearity (no R matrix)
+# ============================================================================
+
+class ElmanMamba2SiluFunction(Function):
+    @staticmethod
+    def forward(ctx, training, x, h0, W_delta, b_delta, W_B, b_B):
+        h, Wx_delta_cache, Bx_cache = lib.elman_mamba2_silu_forward(
+            training, x, h0, W_delta, b_delta, W_B, b_B)
+
+        if training:
+            ctx.save_for_backward(x, W_delta, W_B, h, Wx_delta_cache, Bx_cache)
+
+        return h[1:]
+
+    @staticmethod
+    def backward(ctx, grad_h):
+        x, W_delta, W_B, h, Wx_delta_cache, Bx_cache = ctx.saved_tensors
+
+        B = x.size(1)
+        D = x.size(2)
+        dh_new = torch.zeros(grad_h.size(0) + 1, B, D,
+                           dtype=grad_h.dtype, device=grad_h.device)
+        dh_new[1:] = grad_h
+
+        dx, dh0, dW_delta, db_delta, dW_B, db_B = lib.elman_mamba2_silu_backward(
+            x, W_delta, W_B, h, Wx_delta_cache, Bx_cache, dh_new)
+
+        return None, dx, dh0, dW_delta, db_delta, dW_B, db_B
+
+
+class ElmanMamba2Silu(nn.Module):
+    """
+    Mamba2-style linear recurrence with silu nonlinearity (no R matrix).
+
+    Architecture:
+        delta = softplus(W_delta @ x + b_delta)      -- always positive
+        decay = exp(-delta)                          -- between 0 and 1
+        candidate = silu(W_B @ x + b_B)              -- silu nonlinearity (unbounded)
+        h_new = decay * h + (1 - decay) * candidate
+
+    Key differences from ElmanMamba2:
+    - Uses silu(Bx) instead of just Bx
+    - silu is unbounded for positive x (unlike tanh which saturates)
+
+    This tests whether silu works better than tanh in Mamba2 structure.
+
+    Args:
+        input_size: Dimension of input features.
+        hidden_size: Dimension of hidden state.
+        delta_init: Initial bias for delta projection (default -1.8)
+
+    Input shape: [T, B, D] (time-first)
+    Output shape: [T, B, D]
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, delta_init: float = -1.8):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.delta_init = delta_init
+
+        self.W_delta = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_delta = nn.Parameter(torch.empty(hidden_size))
+        self.W_B = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_B = nn.Parameter(torch.empty(hidden_size))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 1.0 / (self.hidden_size ** 0.5)
+        nn.init.uniform_(self.W_delta, -std * 0.1, std * 0.1)
+        nn.init.constant_(self.b_delta, self.delta_init)
+        nn.init.uniform_(self.W_B, -std, std)
+        nn.init.zeros_(self.b_B)
+
+    def forward(self, x, h0=None):
+        T, B, D = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
+
+        return ElmanMamba2SiluFunction.apply(
+            self.training, x, h0, self.W_delta, self.b_delta, self.W_B, self.b_B
+        )
+
+
+# ============================================================================
 # ElmanLeakySilu: silu + leaky integration (NO output gate)
 # ============================================================================
 
@@ -578,6 +950,106 @@ class ElmanLeakySilu(nn.Module):
 
         return ElmanLeakySiluFunction.apply(
             self.training, x, h0, self.Wx, self.R, self.bias, delta
+        )
+
+
+# ============================================================================
+# ElmanLeakyDiag: tanh + DIAGONAL R + leaky integration (like Mamba's diagonal A!)
+# ============================================================================
+
+class ElmanLeakyDiagFunction(Function):
+    @staticmethod
+    def forward(ctx, training, x, h0, Wx, r, bias, delta):
+        # r: [D] - diagonal recurrence weights (NOT [D,D]!)
+        # delta: [T, B, D] - precomputed delta values (sigmoid output)
+        h, v = lib.elman_leaky_diag_forward(training, x, h0, Wx, r, bias, delta)
+
+        if training:
+            ctx.save_for_backward(x, Wx, r, h, v, delta)
+
+        return h[1:]
+
+    @staticmethod
+    def backward(ctx, grad_h):
+        x, Wx, r, h, v, delta = ctx.saved_tensors
+
+        B = x.size(1)
+        D = x.size(2)
+        dh_new = torch.zeros(grad_h.size(0) + 1, B, D,
+                           dtype=grad_h.dtype, device=grad_h.device)
+        dh_new[1:] = grad_h
+
+        dx, dh0, dWx, dr, dbias, d_delta = lib.elman_leaky_diag_backward(
+            x, Wx, r, h, v, delta, dh_new)
+
+        return None, dx, dh0, dWx, dr, dbias, d_delta
+
+
+class ElmanLeakyDiag(nn.Module):
+    """
+    Elman RNN with DIAGONAL R and leaky integration (like Mamba's diagonal A!).
+
+    Architecture:
+        candidate = tanh(r ⊙ h + Wx @ x + b)           -- r is [D] not [D,D]!
+        delta = sigmoid(W_delta @ x + b_delta)         -- input-dependent blend
+        h_new = (1 - delta) * h + delta * candidate    -- leaky integration
+
+    Benefits over ElmanLeaky:
+    - D params instead of D² for recurrence (massive reduction!)
+    - No GEMM needed - pure elementwise ops (faster!)
+    - Cross-channel mixing happens via Wx @ x (input projection)
+    - Matches Mamba's diagonal A architecture
+
+    Args:
+        input_size: Dimension of input features.
+        hidden_size: Dimension of hidden state.
+        delta_init: Initial bias for delta (default -2.0 -> sigmoid ≈ 0.12)
+
+    Input shape: [T, B, D] (time-first)
+    Output shape: [T, B, D]
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, delta_init: float = -2.0):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.delta_init = delta_init
+
+        # Main Elman weights
+        self.Wx = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.r = nn.Parameter(torch.empty(hidden_size))  # DIAGONAL! [D] not [D,D]
+        self.bias = nn.Parameter(torch.empty(hidden_size))
+
+        # Delta projection weights (input-dependent delta)
+        self.W_delta = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.b_delta = nn.Parameter(torch.empty(hidden_size))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 1.0 / (self.hidden_size ** 0.5)
+        nn.init.uniform_(self.Wx, -std, std)
+        # Initialize diagonal r to small values (like identity-ish)
+        nn.init.uniform_(self.r, -std, std)
+        nn.init.zeros_(self.bias)
+
+        # Initialize delta projection to produce values near sigmoid(delta_init)
+        nn.init.uniform_(self.W_delta, -std * 0.1, std * 0.1)
+        nn.init.constant_(self.b_delta, self.delta_init)
+
+    def forward(self, x, h0=None):
+        T, B, D = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(B, self.hidden_size, dtype=x.dtype, device=x.device)
+
+        # Compute input-dependent delta (can be parallelized over time)
+        x_flat = x.reshape(T * B, D)
+        delta_raw = torch.mm(x_flat, self.W_delta.t()) + self.b_delta
+        delta = torch.sigmoid(delta_raw).reshape(T, B, self.hidden_size)
+
+        return ElmanLeakyDiagFunction.apply(
+            self.training, x, h0, self.Wx, self.r, self.bias, delta
         )
 
 
