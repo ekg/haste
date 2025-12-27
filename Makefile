@@ -21,44 +21,53 @@ LOCAL_CFLAGS := -I/usr/include/eigen3 -I$(CUDA_HOME)/include -Ilib -O3
 LOCAL_LDFLAGS := -L$(CUDA_HOME)/lib64 -L. -lcudart -lcublas
 GPU_ARCH_FLAGS := -gencode arch=compute_80,code=sm_80 -gencode arch=compute_89,code=sm_89
 
-# Small enough project that we can just recompile all the time.
+# All CUDA object files
+CUDA_OBJS := \
+	lib/elman_forward_gpu.o \
+	lib/elman_backward_gpu.o \
+	lib/elman_silu_forward_gpu.o \
+	lib/elman_silu_backward_gpu.o \
+	lib/elman_variants_gpu.o \
+	lib/lstm_forward_gpu.o \
+	lib/lstm_backward_gpu.o \
+	lib/lstm_silu_forward_gpu.o \
+	lib/lstm_silu_backward_gpu.o \
+	lib/gru_forward_gpu.o \
+	lib/gru_backward_gpu.o \
+	lib/gru_silu_forward_gpu.o \
+	lib/gru_silu_backward_gpu.o \
+	lib/skip_elman_forward_gpu.o \
+	lib/skip_elman_backward_gpu.o \
+	lib/layer_norm_forward_gpu.o \
+	lib/layer_norm_backward_gpu.o \
+	lib/layer_norm_lstm_forward_gpu.o \
+	lib/layer_norm_lstm_backward_gpu.o \
+	lib/layer_norm_gru_forward_gpu.o \
+	lib/layer_norm_gru_backward_gpu.o \
+	lib/indrnn_backward_gpu.o \
+	lib/indrnn_forward_gpu.o \
+	lib/layer_norm_indrnn_forward_gpu.o \
+	lib/layer_norm_indrnn_backward_gpu.o \
+	lib/multihead_elman_forward_gpu.o \
+	lib/multihead_elman_backward_gpu.o \
+	lib/elman_triple_r_gpu.o \
+	lib/elman_selective_triple_r_gpu.o \
+	lib/elman_neural_memory_gpu.o \
+	lib/elman_lowrank_r_gpu.o \
+	lib/multihead_triple_r_gpu.o \
+	lib/diagonal_mhtr_gpu.o
+
 .PHONY: all haste haste_tf haste_pytorch libhaste_tf examples benchmarks clean
 
 all: haste haste_tf haste_pytorch examples benchmarks
 
-haste:
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_forward_gpu.cu.cc -o lib/elman_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_backward_gpu.cu.cc -o lib/elman_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_silu_forward_gpu.cu.cc -o lib/elman_silu_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_silu_backward_gpu.cu.cc -o lib/elman_silu_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_variants_gpu.cu.cc -o lib/elman_variants_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/lstm_forward_gpu.cu.cc -o lib/lstm_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/lstm_backward_gpu.cu.cc -o lib/lstm_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/lstm_silu_forward_gpu.cu.cc -o lib/lstm_silu_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/lstm_silu_backward_gpu.cu.cc -o lib/lstm_silu_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/gru_forward_gpu.cu.cc -o lib/gru_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/gru_backward_gpu.cu.cc -o lib/gru_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/gru_silu_forward_gpu.cu.cc -o lib/gru_silu_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/gru_silu_backward_gpu.cu.cc -o lib/gru_silu_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/skip_elman_forward_gpu.cu.cc -o lib/skip_elman_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/skip_elman_backward_gpu.cu.cc -o lib/skip_elman_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_forward_gpu.cu.cc -o lib/layer_norm_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_backward_gpu.cu.cc -o lib/layer_norm_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_lstm_forward_gpu.cu.cc -o lib/layer_norm_lstm_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_lstm_backward_gpu.cu.cc -o lib/layer_norm_lstm_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_gru_forward_gpu.cu.cc -o lib/layer_norm_gru_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_gru_backward_gpu.cu.cc -o lib/layer_norm_gru_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/indrnn_backward_gpu.cu.cc -o lib/indrnn_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/indrnn_forward_gpu.cu.cc -o lib/indrnn_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_indrnn_forward_gpu.cu.cc -o lib/layer_norm_indrnn_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/layer_norm_indrnn_backward_gpu.cu.cc -o lib/layer_norm_indrnn_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/multihead_elman_forward_gpu.cu.cc -o lib/multihead_elman_forward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/multihead_elman_backward_gpu.cu.cc -o lib/multihead_elman_backward_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_triple_r_gpu.cu.cc -o lib/elman_triple_r_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_selective_triple_r_gpu.cu.cc -o lib/elman_selective_triple_r_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_neural_memory_gpu.cu.cc -o lib/elman_neural_memory_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(NVCC) $(GPU_ARCH_FLAGS) -c lib/elman_lowrank_r_gpu.cu.cc -o lib/elman_lowrank_r_gpu.o $(NVCC_FLAGS) $(LOCAL_CFLAGS)
-	$(AR) $(AR_FLAGS) lib/*.o
+# Pattern rule for compiling CUDA files - enables parallel builds with make -j
+lib/%.o: lib/%.cu.cc
+	$(NVCC) $(GPU_ARCH_FLAGS) -c $< -o $@ $(NVCC_FLAGS) $(LOCAL_CFLAGS)
+
+# haste target now depends on object files and just creates archive
+haste: $(CUDA_OBJS)
+	$(AR) $(AR_FLAGS) $(CUDA_OBJS)
 
 libhaste_tf: haste
 	$(eval TF_CFLAGS := $(shell $(PYTHON) -c 'import tensorflow as tf; print(" ".join(tf.sysconfig.get_compile_flags()))'))

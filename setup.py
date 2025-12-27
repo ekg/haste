@@ -62,7 +62,8 @@ from setuptools.dist import Distribution
 
 class BuildHaste(cpp_extension.BuildExtension):
   def run(self):
-    os.system('make haste')
+    # Use parallel make with 12 jobs
+    os.system('make -j12 haste')
     super().run()
 
 
