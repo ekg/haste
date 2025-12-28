@@ -183,19 +183,36 @@ __global__ void LogStorageGatedUpdate(
     }
 }
 
-// Kernel: Compute compete×silu output from log-space hidden state
-// KEY CHANGE: Uses SIGNED log representation for softmax to preserve sign info!
-// signed_log = log|h| * sign_h (positive for h>0, negative for h<0)
-// This correctly differentiates positive vs negative h values in compete.
+// =============================================================================
+// TRUE LOG-SPACE OUTPUT COMPUTATION
+// =============================================================================
+//
+// Key insight: In log space, multiplication becomes addition!
+//   log(a * b) = log(a) + log(b)
+//
+// For output = compete * silu(W_out @ h):
+//   log|output| = log|compete| + log|silu(...)|
+//
+// But we want gradients to flow directly to log_h without the * h factor.
+// Solution: operate entirely on log_h, never convert to h.
+//
+// compete = softmax(log_h)  -- compete on log magnitudes
+// projection = W_out @ log_h  -- weighted sum of log magnitudes
+// output = compete * silu(projection)
+//
+// This way d_output/d_log_h flows directly, no * h chain rule factor!
+// =============================================================================
+
+// Kernel: TRUE log-space output - compete on log_h, project log_h
+// Gradients flow directly to log_h without * h factor
 template<typename T>
-__global__ void LogStorageSelectiveOutput(
+__global__ void LogStorageSelectiveOutputLogSpace(
     const int batch_size,
     const int dim,
     const int n_groups,
     const int group_size,
-    const T* __restrict__ log_h,
-    const T* __restrict__ sign_h,
-    const T* __restrict__ w_out_log_h,  // W_out @ log_h (computed in LOG space!)
+    const T* __restrict__ log_h,       // Log magnitude of hidden state
+    const T* __restrict__ w_out_log_h, // W_out @ log_h
     T* __restrict__ output,
     T* __restrict__ compete_cache) {
 
@@ -208,33 +225,28 @@ __global__ void LogStorageSelectiveOutput(
 
     const int base = b * dim + g * group_size;
 
-    // Use SIGNED log for softmax: signed_log = log|h| * sign
-    // This preserves sign information:
-    // h = +5 → signed_log = +1.61 (large positive, high compete weight)
-    // h = -5 → signed_log = -1.61 (large negative, low compete weight)
-    float max_signed_log = -FLT_MAX;
+    // Softmax on log_h directly (not on h = exp(log_h))
+    // This gives higher compete weight to larger log magnitudes
+    // Equivalent to competing on |h| in log scale
+    float max_log_h = -FLT_MAX;
     for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
         float log_h_val = static_cast<float>(log_h[base + i]);
-        float sign_h_val = static_cast<float>(sign_h[base + i]);
-        float signed_log = log_h_val * sign_h_val;  // positive for h>0, negative for h<0
-        max_signed_log = fmaxf(max_signed_log, signed_log);
+        max_log_h = fmaxf(max_log_h, log_h_val);
     }
-    smem[threadIdx.x] = max_signed_log;
+    smem[threadIdx.x] = max_log_h;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + s]);
         __syncthreads();
     }
-    max_signed_log = smem[0];
+    max_log_h = smem[0];
     __syncthreads();
 
-    // Compute exp sum for softmax(signed_log)
+    // Compute sum for softmax(log_h)
     float sum = 0.0f;
     for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
         float log_h_val = static_cast<float>(log_h[base + i]);
-        float sign_h_val = static_cast<float>(sign_h[base + i]);
-        float signed_log = log_h_val * sign_h_val;
-        sum += expf(signed_log - max_signed_log);
+        sum += expf(log_h_val - max_log_h);
     }
     float* sum_smem = smem + blockDim.x;
     sum_smem[threadIdx.x] = sum;
@@ -245,17 +257,83 @@ __global__ void LogStorageSelectiveOutput(
     }
     sum = sum_smem[0];
 
-    // Compute output: compete(signed_log) * silu(W_out @ log_h)
+    // Output: compete(log_h) * silu(W_out @ log_h)
+    // Both compete and projection operate on log_h directly!
     for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
         float log_h_val = static_cast<float>(log_h[base + i]);
-        float sign_h_val = static_cast<float>(sign_h[base + i]);
-        float signed_log = log_h_val * sign_h_val;
-        float compete = expf(signed_log - max_signed_log) / sum;
+        float compete = expf(log_h_val - max_log_h) / sum;
         if (compete_cache) compete_cache[base + i] = static_cast<T>(compete);
 
         float w = static_cast<float>(w_out_log_h[base + i]);  // W_out @ log_h
         float silu_val = w / (1.0f + expf(-w));
         output[base + i] = static_cast<T>(compete * silu_val);
+    }
+}
+
+// Backward for TRUE log-space output
+// Gradients flow directly to d_log_h, no * h factor!
+template<typename T>
+__global__ void LogStorageSelectiveOutputLogSpaceBackward(
+    const int batch_size,
+    const int dim,
+    const int n_groups,
+    const int group_size,
+    const T* __restrict__ log_h,
+    const T* __restrict__ w_out_log_h,
+    const T* __restrict__ compete,
+    const T* __restrict__ d_output,
+    T* __restrict__ d_log_h,           // Gradient flows DIRECTLY to log_h!
+    T* __restrict__ d_w_out_log_h) {
+
+    extern __shared__ float smem[];
+
+    const int b = blockIdx.x;
+    const int g = blockIdx.y;
+
+    if (b >= batch_size || g >= n_groups) return;
+
+    const int base = b * dim + g * group_size;
+
+    // First compute sum(compete * d_compete) for softmax backward
+    float sum_compete_dcompete = 0.0f;
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        float d_out = static_cast<float>(d_output[base + i]);
+        float w = static_cast<float>(w_out_log_h[base + i]);
+        float silu = w / (1.0f + expf(-w));
+        float d_compete = d_out * silu;  // d_loss/d_compete
+        float comp = static_cast<float>(compete[base + i]);
+        sum_compete_dcompete += comp * d_compete;
+    }
+
+    smem[threadIdx.x] = sum_compete_dcompete;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    sum_compete_dcompete = smem[0];
+    __syncthreads();
+
+    // Compute gradients
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        float d_out = static_cast<float>(d_output[base + i]);
+        float comp = static_cast<float>(compete[base + i]);
+        float w = static_cast<float>(w_out_log_h[base + i]);
+
+        // Gradient through silu
+        float sig_w = 1.0f / (1.0f + expf(-w));
+        float silu = w * sig_w;
+        float d_silu_dw = sig_w + w * sig_w * (1.0f - sig_w);
+
+        // d_w_out_log_h = d_output * compete * d_silu_dw
+        float d_w = d_out * comp * d_silu_dw;
+        d_w_out_log_h[base + i] = static_cast<T>(d_w);
+
+        // Softmax backward: d_log_h = compete * (d_compete - sum(compete * d_compete))
+        // This flows DIRECTLY to log_h, no * h factor!
+        float d_compete = d_out * silu;
+        float d_log_h_val = comp * (d_compete - sum_compete_dcompete);
+        d_log_h[base + i] = static_cast<T>(d_log_h_val);
     }
 }
 
@@ -649,12 +727,11 @@ void LogStorageDiagonalElmanForward<T>::Run(
     const int num_blocks = (BD + block_size - 1) / block_size;
     const int group_size = dim_ / n_groups_;
 
-    // Workspace - h_linear needed for proper output computation
-    T *wx_x, *delta_tmp, *w_out_h, *h_linear;
+    // Workspace for true log-space computation (no h_linear needed!)
+    T *wx_x, *delta_tmp, *w_out_h;
     cudaMalloc(&wx_x, BD * sizeof(T));
     cudaMalloc(&delta_tmp, BD * sizeof(T));
-    cudaMalloc(&w_out_h, BD * sizeof(T));
-    cudaMalloc(&h_linear, BD * sizeof(T));  // Convert log_h to real h for output
+    cudaMalloc(&w_out_h, BD * sizeof(T));  // W_out @ log_h (log-space projection)
 
     for (int t = 0; t < steps; ++t) {
         const T* x_t = x + t * BD;
@@ -683,26 +760,22 @@ void LogStorageDiagonalElmanForward<T>::Run(
             batch_size_, dim_, log_h_prev, sign_h_prev, wx_x, r_h, delta_tmp,
             b, b_delta, log_h_t, sign_h_t, v_t, delta_t, weight1_t, log_term1_t, log_term2_t);
 
-        // Convert log_h to h_linear: h = sign * exp(log_h)
-        // This is needed for proper output computation - log_h is a log magnitude, not a feature!
-        LogToLinearKernel<T><<<num_blocks, block_size, 0, stream_>>>(
-            BD, log_h_t, sign_h_t, h_linear);
-
-        // Compute W_out @ h (real space, not log space!)
+        // TRUE LOG-SPACE OUTPUT: Compute W_out @ log_h (not W_out @ h!)
+        // This keeps everything in log-space - gradients flow directly to log_h
         blas<T>::gemm(blas_handle_, CUBLAS_OP_N, CUBLAS_OP_N,
-            dim_, batch_size_, dim_, &alpha, W_out, dim_, h_linear, dim_, &beta_zero, w_out_h, dim_);
+            dim_, batch_size_, dim_, &alpha, W_out, dim_, log_h_t, dim_, &beta_zero, w_out_h, dim_);
 
-        // Selective output using h_linear (softmax on real h values)
+        // Selective output in log-space: softmax(log_h) * silu(W_out @ log_h)
+        // Both compete and projection operate on log_h directly!
         dim3 grid(batch_size_, n_groups_);
         int smem_size = 2 * block_size * sizeof(float);
-        LogStorageSelectiveOutputLinear<T><<<grid, block_size, smem_size, stream_>>>(
-            batch_size_, dim_, n_groups_, group_size, h_linear, w_out_h, out_t, compete_t);
+        LogStorageSelectiveOutputLogSpace<T><<<grid, block_size, smem_size, stream_>>>(
+            batch_size_, dim_, n_groups_, group_size, log_h_t, w_out_h, out_t, compete_t);
     }
 
     cudaFree(wx_x);
     cudaFree(delta_tmp);
     cudaFree(w_out_h);
-    cudaFree(h_linear);
 }
 
 // =============================================================================
@@ -755,18 +828,16 @@ void LogStorageDiagonalElmanBackward<T>::Run(
     const int num_blocks = (BD + block_size - 1) / block_size;
     const int group_size = dim_ / n_groups_;
 
-    // Workspace for backward pass
+    // Workspace for TRUE LOG-SPACE backward pass (no h_linear needed!)
     T *dv, *d_delta_raw;
     T *d_log_h, *d_log_h_recurrent;
-    T *d_w_out_h, *w_out_h, *h_linear, *d_h_linear;
+    T *d_w_out_log_h, *w_out_log_h;
     cudaMalloc(&dv, BD * sizeof(T));
     cudaMalloc(&d_delta_raw, BD * sizeof(T));
     cudaMalloc(&d_log_h, BD * sizeof(T));
     cudaMalloc(&d_log_h_recurrent, BD * sizeof(T));
-    cudaMalloc(&d_w_out_h, BD * sizeof(T));
-    cudaMalloc(&w_out_h, BD * sizeof(T));
-    cudaMalloc(&h_linear, BD * sizeof(T));
-    cudaMalloc(&d_h_linear, BD * sizeof(T));
+    cudaMalloc(&d_w_out_log_h, BD * sizeof(T));
+    cudaMalloc(&w_out_log_h, BD * sizeof(T));
     cudaMemset(d_log_h_recurrent, 0, BD * sizeof(T));
 
     // Float buffers for atomic gradients
@@ -798,33 +869,25 @@ void LogStorageDiagonalElmanBackward<T>::Run(
         const T* d_out_t = d_output + t * BD;
         T* dx_t = dx + t * BD;
 
-        // Convert log_h to h_linear for backward
-        LogToLinearKernel<T><<<num_blocks, block_size, 0, stream_>>>(
-            BD, log_h_t, sign_h_t, h_linear);
-
-        // Recompute w_out_h = W_out @ h_linear
+        // TRUE LOG-SPACE BACKWARD: Recompute w_out_log_h = W_out @ log_h
         blas<T>::gemm(blas_handle_, CUBLAS_OP_N, CUBLAS_OP_N,
-            dim_, batch_size_, dim_, &alpha, W_out, dim_, h_linear, dim_, &beta_zero, w_out_h, dim_);
+            dim_, batch_size_, dim_, &alpha, W_out, dim_, log_h_t, dim_, &beta_zero, w_out_log_h, dim_);
 
-        // Backward through selective output - gradient goes to d_h_linear
+        // Backward through log-space selective output - gradient flows DIRECTLY to d_log_h!
+        // No conversion needed, no * h factor!
         dim3 grid(batch_size_, n_groups_);
         int smem_size = block_size * sizeof(float);
-        LogStorageSelectiveOutputLinearBackward<T><<<grid, block_size, smem_size, stream_>>>(
-            batch_size_, dim_, n_groups_, group_size, h_linear, w_out_h, compete_t,
-            d_out_t, d_h_linear, d_w_out_h);
+        LogStorageSelectiveOutputLogSpaceBackward<T><<<grid, block_size, smem_size, stream_>>>(
+            batch_size_, dim_, n_groups_, group_size, log_h_t, w_out_log_h, compete_t,
+            d_out_t, d_log_h, d_w_out_log_h);
 
-        // dW_out += d_w_out_h @ h_linear^T
+        // dW_out += d_w_out_log_h @ log_h^T (log-space gradient!)
         blas<T>::gemm(blas_handle_, CUBLAS_OP_N, CUBLAS_OP_T,
-            dim_, dim_, batch_size_, &alpha, d_w_out_h, dim_, h_linear, dim_, &alpha, dW_out, dim_);
+            dim_, dim_, batch_size_, &alpha, d_w_out_log_h, dim_, log_h_t, dim_, &alpha, dW_out, dim_);
 
-        // d_h_linear += W_out^T @ d_w_out_h
+        // d_log_h += W_out^T @ d_w_out_log_h (DIRECT gradient to log_h!)
         blas<T>::gemm(blas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
-            dim_, batch_size_, dim_, &alpha, W_out, dim_, d_w_out_h, dim_, &alpha, d_h_linear, dim_);
-
-        // Convert d_h_linear to d_log_h: d_log_h = d_h * h (chain rule through exp)
-        // h = sign * exp(log_h), so d_log_h = d_h * sign * exp(log_h) = d_h * h
-        ConvertLinearGradToLogGrad<T><<<num_blocks, block_size, 0, stream_>>>(
-            BD, d_h_linear, h_linear, d_log_h);
+            dim_, batch_size_, dim_, &alpha, W_out, dim_, d_w_out_log_h, dim_, &alpha, d_log_h, dim_);
 
         // TRUE LOG-SPACE BACKWARD through gated update
         // Uses softmax weights from forward pass - gradient is BOUNDED!
@@ -874,10 +937,8 @@ void LogStorageDiagonalElmanBackward<T>::Run(
     cudaFree(d_delta_raw);
     cudaFree(d_log_h);
     cudaFree(d_log_h_recurrent);
-    cudaFree(d_w_out_h);
-    cudaFree(w_out_h);
-    cudaFree(h_linear);
-    cudaFree(d_h_linear);
+    cudaFree(d_w_out_log_h);
+    cudaFree(w_out_log_h);
     cudaFree(dr_h_float);
     cudaFree(db_float);
     cudaFree(db_delta_float);
