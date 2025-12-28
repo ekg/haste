@@ -31,6 +31,7 @@ void multihead_elman_init(py::module&);
 void init_elman_advanced(py::module&);
 void init_multihead_triple_r(py::module&);
 void diagonal_mhtr_init(py::module&);
+void elman_ladder_init(py::module&);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   elman_init(m);
@@ -49,4 +50,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   init_elman_advanced(m);
   init_multihead_triple_r(m);
   diagonal_mhtr_init(m);
+  elman_ladder_init(m);
 }

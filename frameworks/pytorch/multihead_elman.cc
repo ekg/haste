@@ -1,6 +1,6 @@
 // Copyright 2024 Erik Garrison. Apache 2.0 License.
 //
-// PyTorch bindings for Multi-head Elman RNN.
+// PyTorch bindings for Multi-head Elman RNN with reset gate.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -22,6 +22,7 @@ std::vector<Tensor> multihead_elman_forward(
     Tensor x,           // [T, B, nheads, headdim] - input sequence
     Tensor h0,          // [B, nheads, headdim] - initial hidden state
     Tensor R,           // [nheads, headdim, headdim] - recurrent weights per head
+    Tensor Wr,          // [nheads, headdim, headdim] - reset gate weights per head
     Tensor Wx,          // [nheads, headdim, headdim] - input weights per head
     Tensor bias,        // [nheads, headdim] - bias per head
     int activation) {   // 0=softsign, 1=tanh_residual, 2=tanh
@@ -33,6 +34,7 @@ std::vector<Tensor> multihead_elman_forward(
     CHECK_INPUT(x);
     CHECK_INPUT(h0);
     CHECK_INPUT(R);
+    CHECK_INPUT(Wr);
     CHECK_INPUT(Wx);
     CHECK_INPUT(bias);
 
@@ -43,13 +45,18 @@ std::vector<Tensor> multihead_elman_forward(
     // h contains all hidden states: h[0] = h0, h[1..T] = outputs
     Tensor h = torch::empty({ time_steps + 1, batch_size, nheads, headdim }, options);
     Tensor y = torch::empty({ time_steps, batch_size, nheads, headdim }, options);
+    Tensor r_gate = training
+        ? torch::empty({ time_steps, batch_size, nheads, headdim }, options)
+        : torch::empty({ 0 }, options);
     Tensor pre_act = training
         ? torch::empty({ time_steps, batch_size, nheads, headdim }, options)
         : torch::empty({ 0 }, options);
 
     // Workspace tensors
     Tensor tmp_Rh = torch::empty({ batch_size, nheads, headdim }, options);
+    Tensor tmp_Wrx = torch::empty({ time_steps, batch_size, nheads, headdim }, options);
     Tensor tmp_Wxx = torch::empty({ time_steps, batch_size, nheads, headdim }, options);
+    Tensor tmp_h_gated = torch::empty({ batch_size, nheads, headdim }, options);
 
     // Initialize h[0] with h0
     h[0] = h0;
@@ -67,24 +74,30 @@ std::vector<Tensor> multihead_elman_forward(
         forward.Run(
             time_steps,
             ptr<scalar_t>(R),
+            ptr<scalar_t>(Wr),
             ptr<scalar_t>(Wx),
             ptr<scalar_t>(bias),
             ptr<scalar_t>(x),
             ptr<scalar_t>(h),
             ptr<scalar_t>(y),
+            training ? ptr<scalar_t>(r_gate) : nullptr,
             training ? ptr<scalar_t>(pre_act) : nullptr,
             ptr<scalar_t>(tmp_Rh),
-            ptr<scalar_t>(tmp_Wxx));
+            ptr<scalar_t>(tmp_Wrx),
+            ptr<scalar_t>(tmp_Wxx),
+            ptr<scalar_t>(tmp_h_gated));
     }));
 
-    return { h, y, pre_act };
+    return { h, y, r_gate, pre_act };
 }
 
 std::vector<Tensor> multihead_elman_backward(
     Tensor x,           // [T, B, nheads, headdim] - input sequence
     Tensor R,           // [nheads, headdim, headdim] - recurrent weights
+    Tensor Wr,          // [nheads, headdim, headdim] - reset gate weights
     Tensor Wx,          // [nheads, headdim, headdim] - input weights
     Tensor h,           // [T+1, B, nheads, headdim] - hidden states from forward
+    Tensor r_gate,      // [T, B, nheads, headdim] - saved reset gate values
     Tensor pre_act,     // [T, B, nheads, headdim] - saved pre-activations
     Tensor dy,          // [T, B, nheads, headdim] - gradient of loss w.r.t. output
     int activation) {   // 0=softsign, 1=tanh_residual, 2=tanh
@@ -95,8 +108,10 @@ std::vector<Tensor> multihead_elman_backward(
 
     CHECK_INPUT(x);
     CHECK_INPUT(R);
+    CHECK_INPUT(Wr);
     CHECK_INPUT(Wx);
     CHECK_INPUT(h);
+    CHECK_INPUT(r_gate);
     CHECK_INPUT(pre_act);
     CHECK_INPUT(dy);
 
@@ -106,6 +121,7 @@ std::vector<Tensor> multihead_elman_backward(
     // Output gradient tensors
     Tensor dx = torch::empty({ time_steps, batch_size, nheads, headdim }, options);
     Tensor dR = torch::zeros({ nheads, headdim, headdim }, options);
+    Tensor dWr = torch::zeros({ nheads, headdim, headdim }, options);
     Tensor dWx = torch::zeros({ nheads, headdim, headdim }, options);
     Tensor db = torch::zeros({ nheads, headdim }, options);
     Tensor dh0 = torch::zeros({ batch_size, nheads, headdim }, options);
@@ -113,6 +129,9 @@ std::vector<Tensor> multihead_elman_backward(
     // Workspace
     Tensor tmp_dpre = torch::empty({ batch_size, nheads, headdim }, options);
     Tensor tmp_dh = torch::empty({ batch_size, nheads, headdim }, options);
+    Tensor tmp_dh_gated = torch::empty({ batch_size, nheads, headdim }, options);
+    Tensor tmp_dWrx = torch::empty({ batch_size, nheads, headdim }, options);
+    Tensor tmp_h_gated = torch::empty({ batch_size, nheads, headdim }, options);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "multihead_elman_backward", ([&] {
         BackwardPass<typename native_type<scalar_t>::T> backward(
@@ -126,28 +145,34 @@ std::vector<Tensor> multihead_elman_backward(
         backward.Run(
             time_steps,
             ptr<scalar_t>(R),
+            ptr<scalar_t>(Wr),
             ptr<scalar_t>(Wx),
             ptr<scalar_t>(x),
             ptr<scalar_t>(h),
+            ptr<scalar_t>(r_gate),
             ptr<scalar_t>(pre_act),
             ptr<scalar_t>(dy),
             ptr<scalar_t>(dx),
             ptr<scalar_t>(dR),
+            ptr<scalar_t>(dWr),
             ptr<scalar_t>(dWx),
             ptr<scalar_t>(db),
             ptr<scalar_t>(dh0),
             ptr<scalar_t>(tmp_dpre),
-            ptr<scalar_t>(tmp_dh));
+            ptr<scalar_t>(tmp_dh),
+            ptr<scalar_t>(tmp_dh_gated),
+            ptr<scalar_t>(tmp_dWrx),
+            ptr<scalar_t>(tmp_h_gated));
     }));
 
-    return { dx, dh0, dR, dWx, db };
+    return { dx, dh0, dR, dWr, dWx, db };
 }
 
 }  // anonymous namespace
 
 void multihead_elman_init(py::module& m) {
-    m.def("multihead_elman_forward", &multihead_elman_forward, "MultiHeadElman forward",
+    m.def("multihead_elman_forward", &multihead_elman_forward, "MultiHeadElman forward (with reset gate)",
           py::call_guard<py::gil_scoped_release>());
-    m.def("multihead_elman_backward", &multihead_elman_backward, "MultiHeadElman backward",
+    m.def("multihead_elman_backward", &multihead_elman_backward, "MultiHeadElman backward (with reset gate)",
           py::call_guard<py::gil_scoped_release>());
 }

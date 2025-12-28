@@ -1,5 +1,22 @@
 // Copyright 2024 Erik Garrison. Apache 2.0 License.
-// Multi-head Elman RNN backward pass.
+// Multi-head Elman RNN backward pass with RESET GATE.
+//
+// Forward architecture:
+//   r[i] = sigmoid(Wr[i] @ x[i])           // Reset gate (input-only)
+//   h_gated[i] = r[i] * h[i]               // Gate the history
+//   h_new[i] = activation(R[i] @ h_gated[i] + Wx[i] @ x[i] + b[i])
+//
+// Backward path:
+//   dpre = (dy + dh_next) * d_activation(pre)
+//   dR += dpre @ h_gated.T
+//   dWx += dpre @ x.T
+//   db += sum(dpre)
+//   dh_gated = R.T @ dpre
+//   dh = dh_gated * r  (gradient through h_gated = r * h)
+//   dr = dh_gated * h
+//   dWrx = dr * r * (1-r)  (sigmoid gradient)
+//   dWr += dWrx @ x.T
+//   dx += Wx.T @ dpre + Wr.T @ dWrx
 //
 // Uses cublasSgemmStridedBatched to process all heads in single kernel calls.
 
@@ -86,6 +103,80 @@ void FusedActivationBackwardKernel(
     }
 
     dpre[idx] = dh_total * d_act;
+}
+
+// Reset gate backward kernel
+// Computes:
+//   dh = dh_gated * r  (gradient through h_gated = r * h)
+//   dr = dh_gated * h
+//   dWrx = dr * r * (1-r)  (sigmoid derivative: r*(1-r))
+template<typename T>
+__global__
+void ResetGateBackwardKernel(
+    const int size,
+    const T* __restrict__ dh_gated,   // [B, nheads, headdim] - gradient from R.T @ dpre
+    const T* __restrict__ r,          // [B, nheads, headdim] - saved reset gate values
+    const T* __restrict__ h,          // [B, nheads, headdim] - hidden state
+    T* __restrict__ dh,               // [B, nheads, headdim] - gradient to previous h
+    T* __restrict__ dWrx              // [B, nheads, headdim] - gradient for Wr @ x
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= size) return;
+
+    const T r_val = r[idx];
+    const T h_val = h[idx];
+    const T dh_gated_val = dh_gated[idx];
+
+    // dh = dh_gated * r
+    dh[idx] = dh_gated_val * r_val;
+
+    // dr = dh_gated * h
+    // dWrx = dr * sigmoid'(Wrx) = dr * r * (1-r)
+    const T dr = dh_gated_val * h_val;
+    dWrx[idx] = dr * r_val * (static_cast<T>(1.0) - r_val);
+}
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+template<>
+__global__
+void ResetGateBackwardKernel(
+    const int size,
+    const __nv_bfloat16* __restrict__ dh_gated,
+    const __nv_bfloat16* __restrict__ r,
+    const __nv_bfloat16* __restrict__ h,
+    __nv_bfloat16* __restrict__ dh,
+    __nv_bfloat16* __restrict__ dWrx
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= size) return;
+
+    // Compute in float for numerical stability
+    float r_val = __bfloat162float(r[idx]);
+    float h_val = __bfloat162float(h[idx]);
+    float dh_gated_val = __bfloat162float(dh_gated[idx]);
+
+    // dh = dh_gated * r
+    dh[idx] = __float2bfloat16(dh_gated_val * r_val);
+
+    // dr = dh_gated * h
+    // dWrx = dr * sigmoid'(Wrx) = dr * r * (1-r)
+    float dr = dh_gated_val * h_val;
+    dWrx[idx] = __float2bfloat16(dr * r_val * (1.0f - r_val));
+}
+#endif
+
+// Simple elementwise multiply: out = a * b
+template<typename T>
+__global__
+void ElementwiseMultiplyKernel(
+    const int size,
+    const T* __restrict__ a,
+    const T* __restrict__ b,
+    T* __restrict__ out
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= size) return;
+    out[idx] = a[idx] * b[idx];
 }
 
 // Kernel: Accumulate bias gradient
@@ -213,19 +304,25 @@ BackwardPass<T>::~BackwardPass() {
 template<typename T>
 void BackwardPass<T>::Run(
     const int steps,
-    const T* R,
-    const T* Wx,
-    const T* x,
-    const T* h,
-    const T* pre_act,
-    const T* dy,
-    T* dx,
-    T* dR,
-    T* dWx,
-    T* db,
-    T* dh0,
-    T* tmp_dpre,
-    T* tmp_dh
+    const T* R,         // [nheads, headdim, headdim] - recurrent weights
+    const T* Wr,        // [nheads, headdim, headdim] - reset gate weights
+    const T* Wx,        // [nheads, headdim, headdim] - input weights
+    const T* x,         // [T, B, nheads, headdim] - input sequence
+    const T* h,         // [T+1, B, nheads, headdim] - all hidden states
+    const T* r_gate,    // [T, B, nheads, headdim] - saved reset gate values
+    const T* pre_act,   // [T, B, nheads, headdim] - saved pre-activations
+    const T* dy,        // [T, B, nheads, headdim] - output gradients
+    T* dx,              // [T, B, nheads, headdim] - input gradients
+    T* dR,              // [nheads, headdim, headdim] - R gradients
+    T* dWr,             // [nheads, headdim, headdim] - Wr gradients
+    T* dWx,             // [nheads, headdim, headdim] - Wx gradients
+    T* db,              // [nheads, headdim] - bias gradients
+    T* dh0,             // [B, nheads, headdim] - initial hidden state gradient
+    T* tmp_dpre,        // [B, nheads, headdim] - workspace
+    T* tmp_dh,          // [B, nheads, headdim] - workspace for dh from next step
+    T* tmp_dh_gated,    // [B, nheads, headdim] - workspace for dh_gated
+    T* tmp_dWrx,        // [B, nheads, headdim] - workspace for dWrx
+    T* tmp_h_gated      // [B, nheads, headdim] - workspace to recompute h_gated
 ) {
     static const T alpha = static_cast<T>(1.0);
     static const T beta_zero = static_cast<T>(0.0);
@@ -255,13 +352,14 @@ void BackwardPass<T>::Run(
         const T* dy_t = dy + t * BNH;
         const T* pre_act_t = pre_act + t * BNH;
         const T* x_t = x + t * BNH;
-        const T* h_t = h + t * BNH;
+        const T* h_t = h + t * BNH;       // h[t], the input hidden state for this step
+        const T* r_t = r_gate + t * BNH;  // saved reset gate values
         T* dx_t = dx + t * BNH;
 
-        // Step 1: dpre = (dy + dh_from_next) * d_activation(pre)
         const int threads = 256;
         const int blocks = (BNH + threads - 1) / threads;
 
+        // Step 1: dpre = (dy + dh_from_next) * d_activation(pre)
         if (activation == 0) {
             FusedActivationBackwardKernel<T, 0><<<blocks, threads, 0, stream>>>(
                 BNH, dy_t, tmp_dh, pre_act_t, tmp_dpre);
@@ -273,23 +371,24 @@ void BackwardPass<T>::Run(
                 BNH, dy_t, tmp_dh, pre_act_t, tmp_dpre);
         }
 
-        // Step 2: Accumulate dR and dWx using batched GEMM
-        // dR[n] += dpre[n].T @ h[n] for each head n
-        // Shape: [headdim, B] @ [B, headdim] = [headdim, headdim]
-        // In cuBLAS: [headdim, headdim] = [headdim, B] @ [B, headdim].T
-        //         = dpre[n] @ h[n].T with CUBLAS_OP_N, CUBLAS_OP_T
+        // Step 2: Recompute h_gated = r * h for dR gradient
+        ElementwiseMultiplyKernel<T><<<blocks, threads, 0, stream>>>(
+            BNH, r_t, h_t, tmp_h_gated);
 
+        // Step 3: Accumulate dR using h_gated
+        // dR[n] += dpre[n] @ h_gated[n].T
         stridedBatchedGemm(blas_handle,
             CUBLAS_OP_N, CUBLAS_OP_T,
-            headdim, headdim, batch_size,  // M, N, K
+            headdim, headdim, batch_size,
             &alpha,
-            tmp_dpre, NH, strideH,         // dpre, lda, strideA
-            h_t, NH, strideH,              // h, ldb, strideB
-            &beta_one,                     // Accumulate!
-            dR, headdim, strideW,          // dR, ldc, strideC
+            tmp_dpre, NH, strideH,
+            tmp_h_gated, NH, strideH,
+            &beta_one,
+            dR, headdim, strideW,
             nheads);
 
-        // dWx[n] += dpre[n].T @ x[n]
+        // Step 4: Accumulate dWx
+        // dWx[n] += dpre[n] @ x[n].T
         stridedBatchedGemm(blas_handle,
             CUBLAS_OP_N, CUBLAS_OP_T,
             headdim, headdim, batch_size,
@@ -300,36 +399,61 @@ void BackwardPass<T>::Run(
             dWx, headdim, strideW,
             nheads);
 
-        // Accumulate db
+        // Step 5: Accumulate db
         AccumulateBiasGradKernel<T><<<(NH + 255) / 256, 256, 0, stream>>>(
             batch_size, nheads, headdim, tmp_dpre, db);
 
-        // Step 3: Compute dx and dh for previous timestep
-        // dx[t] = Wx.T @ dpre (batched)
-        // dh = R.T @ dpre (batched)
-
-        cudaMemsetAsync(tmp_dh, 0, BNH * sizeof(T), stream);
-
-        // dx = Wx.T @ dpre
+        // Step 6: Compute dh_gated = R.T @ dpre
         stridedBatchedGemm(blas_handle,
             CUBLAS_OP_T, CUBLAS_OP_N,
-            headdim, batch_size, headdim,  // M, N, K
+            headdim, batch_size, headdim,
             &alpha,
-            Wx, headdim, strideW,          // Wx.T
+            R, headdim, strideW,
+            tmp_dpre, NH, strideH,
+            &beta_zero,
+            tmp_dh_gated, NH, strideH,
+            nheads);
+
+        // Step 7: Backprop through reset gate
+        // dh = dh_gated * r  (gradient through h_gated = r * h)
+        // dr = dh_gated * h
+        // dWrx = dr * r * (1-r)  (sigmoid derivative)
+        ResetGateBackwardKernel<T><<<blocks, threads, 0, stream>>>(
+            BNH, tmp_dh_gated, r_t, h_t, tmp_dh, tmp_dWrx);
+
+        // Step 8: Compute dx
+        // dx[t] = Wx.T @ dpre + Wr.T @ dWrx
+        stridedBatchedGemm(blas_handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            headdim, batch_size, headdim,
+            &alpha,
+            Wx, headdim, strideW,
             tmp_dpre, NH, strideH,
             &beta_zero,
             dx_t, NH, strideH,
             nheads);
 
-        // dh = R.T @ dpre
+        // dx += Wr.T @ dWrx
         stridedBatchedGemm(blas_handle,
             CUBLAS_OP_T, CUBLAS_OP_N,
             headdim, batch_size, headdim,
             &alpha,
-            R, headdim, strideW,           // R.T
-            tmp_dpre, NH, strideH,
-            &beta_zero,
-            tmp_dh, NH, strideH,
+            Wr, headdim, strideW,
+            tmp_dWrx, NH, strideH,
+            &beta_one,
+            dx_t, NH, strideH,
+            nheads);
+
+        // Step 9: Accumulate dWr
+        // dWr += dWrx @ x.T
+        stridedBatchedGemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            headdim, headdim, batch_size,
+            &alpha,
+            tmp_dWrx, NH, strideH,
+            x_t, NH, strideH,
+            &beta_one,
+            dWr, headdim, strideW,
             nheads);
     }
 

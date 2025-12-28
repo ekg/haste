@@ -18,16 +18,22 @@ rule compile
 
 
 
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/diagonal_mhtr.o: compile /home/erikg/haste_src/frameworks/pytorch/diagonal_mhtr.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman.o: compile /home/erikg/haste_src/frameworks/pytorch/elman.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_advanced.o: compile /home/erikg/haste_src/frameworks/pytorch/elman_advanced.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_ladder.o: compile /home/erikg/haste_src/frameworks/pytorch/elman_ladder.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_silu.o: compile /home/erikg/haste_src/frameworks/pytorch/elman_silu.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/elman_variants.o: compile /home/erikg/haste_src/frameworks/pytorch/elman_variants.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/gru.o: compile /home/erikg/haste_src/frameworks/pytorch/gru.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/gru_silu.o: compile /home/erikg/haste_src/frameworks/pytorch/gru_silu.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/indrnn.o: compile /home/erikg/haste_src/frameworks/pytorch/indrnn.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_gru.o: compile /home/erikg/haste_src/frameworks/pytorch/layer_norm_gru.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_indrnn.o: compile /home/erikg/haste_src/frameworks/pytorch/layer_norm_indrnn.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/layer_norm_lstm.o: compile /home/erikg/haste_src/frameworks/pytorch/layer_norm_lstm.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/lstm.o: compile /home/erikg/haste_src/frameworks/pytorch/lstm.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/lstm_silu.o: compile /home/erikg/haste_src/frameworks/pytorch/lstm_silu.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/multihead_elman.o: compile /home/erikg/haste_src/frameworks/pytorch/multihead_elman.cc
+build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/multihead_triple_r.o: compile /home/erikg/haste_src/frameworks/pytorch/multihead_triple_r.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/skip_elman.o: compile /home/erikg/haste_src/frameworks/pytorch/skip_elman.cc
 build /home/erikg/haste_src/build/temp.linux-x86_64-cpython-311/frameworks/pytorch/support.o: compile /home/erikg/haste_src/frameworks/pytorch/support.cc
 

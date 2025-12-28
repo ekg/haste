@@ -45,21 +45,6 @@ struct blas {
   };
 };
 
-template<>
-struct blas<__half> {
-  static constexpr decltype(cublasHgemm)* gemm = &cublasHgemm;
-};
-
-template<>
-struct blas<float> {
-  static constexpr decltype(cublasSgemm)* gemm = &cublasSgemm;
-};
-
-template<>
-struct blas<double> {
-  static constexpr decltype(cublasDgemm)* gemm = &cublasDgemm;
-};
-
 // BF16 wrapper using cublasGemmEx (no direct cublasBgemm exists)
 #include <cuda_bf16.h>
 
@@ -89,4 +74,100 @@ inline cublasStatus_t cublasBf16Gemm(
 template<>
 struct blas<__nv_bfloat16> {
   static constexpr decltype(cublasBf16Gemm)* gemm = &cublasBf16Gemm;
+
+  static cublasStatus_t gemmStridedBatched(
+      cublasHandle_t handle,
+      cublasOperation_t transa, cublasOperation_t transb,
+      int m, int n, int k,
+      const __nv_bfloat16* alpha,
+      const __nv_bfloat16* A, int lda, long long strideA,
+      const __nv_bfloat16* B, int ldb, long long strideB,
+      const __nv_bfloat16* beta,
+      __nv_bfloat16* C, int ldc, long long strideC,
+      int batchCount) {
+    float alpha_f = __bfloat162float(*alpha);
+    float beta_f = __bfloat162float(*beta);
+    return cublasGemmStridedBatchedEx(
+        handle, transa, transb, m, n, k,
+        &alpha_f,
+        A, CUDA_R_16BF, lda, strideA,
+        B, CUDA_R_16BF, ldb, strideB,
+        &beta_f,
+        C, CUDA_R_16BF, ldc, strideC,
+        batchCount,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+  }
+};
+
+// Strided batched GEMM for float
+template<>
+struct blas<float> {
+  static constexpr decltype(cublasSgemm)* gemm = &cublasSgemm;
+
+  static cublasStatus_t gemmStridedBatched(
+      cublasHandle_t handle,
+      cublasOperation_t transa, cublasOperation_t transb,
+      int m, int n, int k,
+      const float* alpha,
+      const float* A, int lda, long long strideA,
+      const float* B, int ldb, long long strideB,
+      const float* beta,
+      float* C, int ldc, long long strideC,
+      int batchCount) {
+    return cublasSgemmStridedBatched(
+        handle, transa, transb, m, n, k,
+        alpha, A, lda, strideA,
+        B, ldb, strideB,
+        beta, C, ldc, strideC,
+        batchCount);
+  }
+};
+
+// Strided batched GEMM for double
+template<>
+struct blas<double> {
+  static constexpr decltype(cublasDgemm)* gemm = &cublasDgemm;
+
+  static cublasStatus_t gemmStridedBatched(
+      cublasHandle_t handle,
+      cublasOperation_t transa, cublasOperation_t transb,
+      int m, int n, int k,
+      const double* alpha,
+      const double* A, int lda, long long strideA,
+      const double* B, int ldb, long long strideB,
+      const double* beta,
+      double* C, int ldc, long long strideC,
+      int batchCount) {
+    return cublasDgemmStridedBatched(
+        handle, transa, transb, m, n, k,
+        alpha, A, lda, strideA,
+        B, ldb, strideB,
+        beta, C, ldc, strideC,
+        batchCount);
+  }
+};
+
+// Strided batched GEMM for half
+template<>
+struct blas<__half> {
+  static constexpr decltype(cublasHgemm)* gemm = &cublasHgemm;
+
+  static cublasStatus_t gemmStridedBatched(
+      cublasHandle_t handle,
+      cublasOperation_t transa, cublasOperation_t transb,
+      int m, int n, int k,
+      const __half* alpha,
+      const __half* A, int lda, long long strideA,
+      const __half* B, int ldb, long long strideB,
+      const __half* beta,
+      __half* C, int ldc, long long strideC,
+      int batchCount) {
+    return cublasHgemmStridedBatched(
+        handle, transa, transb, m, n, k,
+        alpha, A, lda, strideA,
+        B, ldb, strideB,
+        beta, C, ldc, strideC,
+        batchCount);
+  }
 };

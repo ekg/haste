@@ -1,8 +1,10 @@
 // Copyright 2024 Erik Garrison. Apache 2.0 License.
-// Multi-head Elman RNN forward pass with per-head R matrices.
+// Multi-head Elman RNN forward pass with per-head R matrices and RESET GATE.
 //
 // Architecture per timestep per head:
-//   h_new[i] = softsign(R[i] @ h[i] + Wx[i] @ x[i] + b[i])
+//   r[i] = sigmoid(Wr[i] @ x[i])           // Reset gate (input-only)
+//   h_gated[i] = r[i] * h[i]               // Gate the history
+//   h_new[i] = activation(R[i] @ h_gated[i] + Wx[i] @ x[i] + b[i])
 //
 // Key optimization: Use cublasSgemmStridedBatched to process ALL heads
 // in a SINGLE kernel call, eliminating per-head loop overhead.
@@ -11,6 +13,7 @@
 //   x:  [T, B, nheads, headdim] - input
 //   h:  [B, nheads, headdim] - hidden state
 //   R:  [nheads, headdim, headdim] - recurrent weights
+//   Wr: [nheads, headdim, headdim] - reset gate weights
 //   Wx: [nheads, headdim, headdim] - input weights
 //   b:  [nheads, headdim] - bias
 
@@ -49,7 +52,64 @@ __nv_bfloat16 softsign(const __nv_bfloat16 x) {
 }
 #endif
 
-// Fused kernel: h_new = activation(Rh + Wxx + b)
+// Sigmoid activation for reset gate
+template<typename T>
+__device__ __forceinline__
+T reset_gate_sigmoid(const T x) {
+    return static_cast<T>(1.0) / (static_cast<T>(1.0) + expf(static_cast<float>(-x)));
+}
+
+// Specialization for float
+template<>
+__device__ __forceinline__
+float reset_gate_sigmoid(const float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// Specialization for double
+template<>
+__device__ __forceinline__
+double reset_gate_sigmoid(const double x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
+template<>
+__device__ __forceinline__
+__half reset_gate_sigmoid(const __half x) {
+    float xf = __half2float(x);
+    return __float2half(1.0f / (1.0f + expf(-xf)));
+}
+#endif
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+template<>
+__device__ __forceinline__
+__nv_bfloat16 reset_gate_sigmoid(const __nv_bfloat16 x) {
+    float xf = __bfloat162float(x);
+    return __float2bfloat16(1.0f / (1.0f + expf(-xf)));
+}
+#endif
+
+// Reset gate kernel: r = sigmoid(Wrx), h_gated = r * h
+template<typename T>
+__global__
+void ResetGateKernel(
+    const int size,
+    const T* __restrict__ Wrx,     // [B, nheads, headdim] - Wr @ x
+    const T* __restrict__ h,       // [B, nheads, headdim] - hidden state
+    T* __restrict__ r,             // [B, nheads, headdim] - reset gate values (saved for backward)
+    T* __restrict__ h_gated        // [B, nheads, headdim] - gated hidden state
+) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= size) return;
+
+    const T r_val = reset_gate_sigmoid(Wrx[idx]);
+    r[idx] = r_val;
+    h_gated[idx] = r_val * h[idx];
+}
+
+// Fused kernel: h_new = activation(Rh_gated + Wxx + b)
 template<typename T, int Activation>
 __global__
 void FusedActivationKernel(
@@ -198,14 +258,18 @@ template<typename T>
 void ForwardPass<T>::Run(
     const int steps,
     const T* R,         // [nheads, headdim, headdim] - recurrent weights
+    const T* Wr,        // [nheads, headdim, headdim] - reset gate weights
     const T* Wx,        // [nheads, headdim, headdim] - input weights
     const T* b,         // [nheads, headdim] - bias
     const T* x,         // [T, B, nheads, headdim] - input sequence
     T* h,               // [T+1, B, nheads, headdim] - all hidden states (h[0]=h0 on input)
     T* y,               // [T, B, nheads, headdim] - output sequence
+    T* r_gate,          // [T, B, nheads, headdim] - saved reset gate values for backward
     T* pre_act,         // [T, B, nheads, headdim] - saved pre-activations
-    T* tmp_Rh,          // [B, nheads, headdim] - workspace for R @ h
-    T* tmp_Wxx          // [T, B, nheads, headdim] - pre-computed Wx @ x
+    T* tmp_Rh,          // [B, nheads, headdim] - workspace for R @ h_gated
+    T* tmp_Wrx,         // [T, B, nheads, headdim] - pre-computed Wr @ x
+    T* tmp_Wxx,         // [T, B, nheads, headdim] - pre-computed Wx @ x
+    T* tmp_h_gated      // [B, nheads, headdim] - workspace for gated hidden state
 ) {
     static const T alpha = static_cast<T>(1.0);
     static const T beta_zero = static_cast<T>(0.0);
@@ -228,68 +292,23 @@ void ForwardPass<T>::Run(
     const long long strideH = headdim;            // Stride between head slices in h
 
     // =========================================================================
-    // Pre-compute Wx @ x for ALL timesteps using strided batched GEMM
+    // Pre-compute Wr @ x and Wx @ x for ALL timesteps
     // =========================================================================
-    // For each head n and timestep t, batch b:
-    //   Wxx[t,b,n,:] = Wx[n] @ x[t,b,n,:]
-    //
-    // Using batched GEMM with batch = nheads * T * B:
-    //   - But Wx only has nheads matrices, need to "broadcast" over T*B
-    //   - Solution: Process T*B samples together, batch over heads
-    //
-    // For strided batched GEMM over heads (batch = nheads):
-    //   Each GEMM: Wx[n] @ X[n] where X[n] is [headdim, T*B] (all samples for head n)
-    //
-    // Layout:
-    //   x: [T, B, nheads, headdim] -> for head n, x[:,:,n,:] is [T*B, headdim]
-    //      Element x[t,b,n,d] at index (t*B + b)*NH + n*headdim + d
-    //      Head n starts at x + n*headdim, stride between samples = NH
-    //
-    // We want: C = Wx @ B^T where B is [T*B, headdim] for each head
-    // In cuBLAS (column-major): C[headdim, T*B] = Wx[headdim, headdim] @ B[headdim, T*B]
-    //   - A = Wx[n], lda = headdim, strideA = headdim*headdim
-    //   - B = x at head n, ldb = NH (stride between "columns" = stride between samples)
-    //   - C = tmp_Wxx at head n, ldc = NH
-
-    stridedBatchedGemm(blas_handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        headdim, steps * batch_size, headdim,  // M, N, K
-        &alpha,
-        Wx, headdim, strideW,                  // A, lda, strideA (between heads)
-        x, NH, 0,                              // B, ldb, strideB=0 (same stride pattern for all heads)
-        &beta_zero,
-        tmp_Wxx, NH, 0,                        // C, ldc, strideC=0
-        nheads);
-
-    // Wait, strideB=0 means all batches use same B, that's wrong!
-    // The issue: x has interleaved heads, not blocked.
-    //
-    // For head n: x[:,:,n,:] elements are at x + n*headdim with stride NH between samples
-    // For head n+1: elements are at x + (n+1)*headdim with stride NH
-    // So strideB = headdim (distance between head 0 start and head 1 start)
-
-    // Actually let's re-do this more carefully.
-    // Process all T*B*nheads operations as a single batched GEMM:
-    //   - batch = nheads
-    //   - Each batch: Wx[n] @ x_matrix[n] where x_matrix[n] is [headdim, T*B]
-    //   - x_matrix[n] is at x + n*headdim, with elements strided by NH
-
-    // Hmm, the problem is that strideB in cublas is the stride between MATRICES in the batch,
-    // not the stride between elements within a matrix.
-    //
-    // With our layout, x[:,:,n,:] viewed as [T*B, headdim] has:
-    //   - ldb = NH (stride between "rows" in column-major = stride between samples)
-    //   - strideB = headdim (distance from head n to head n+1)
-    //
-    // This should work!
-
-    // Actually, I realize there's still an issue. Let me use a simpler approach:
-    // Process each head with a single large GEMM (no batching needed for Wx @ x).
-    // The bottleneck is the per-timestep R @ h, not the pre-computed Wx @ x.
-
-    // For Wx @ x: one GEMM per head, but each GEMM processes all T*B samples
     for (int head = 0; head < nheads; ++head) {
+        const T* Wr_head = Wr + head * headdim * headdim;
         const T* Wx_head = Wx + head * headdim * headdim;
+
+        // Wr @ x for reset gate
+        blas<T>::gemm(blas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            headdim, steps * batch_size, headdim,
+            &alpha,
+            Wr_head, headdim,
+            x + head * headdim, NH,
+            &beta_zero,
+            tmp_Wrx + head * headdim, NH);
+
+        // Wx @ x for input
         blas<T>::gemm(blas_handle,
             CUBLAS_OP_N, CUBLAS_OP_N,
             headdim, steps * batch_size, headdim,
@@ -301,43 +320,54 @@ void ForwardPass<T>::Run(
     }
 
     // =========================================================================
-    // Main recurrence loop - this is where we need maximum efficiency!
+    // Main recurrence loop with reset gate
     // =========================================================================
     // h[0] = h0 (already initialized by caller)
     // For each timestep t:
-    //   tmp_Rh = R @ h[t]  (batched over heads)
-    //   h[t+1] = y[t] = activation(tmp_Rh + tmp_Wxx[t] + b)
+    //   r = sigmoid(Wr @ x[t])         // Reset gate
+    //   h_gated = r * h[t]             // Gate the history
+    //   tmp_Rh = R @ h_gated           // Recurrence on gated history
+    //   h[t+1] = y[t] = activation(tmp_Rh + Wx @ x[t] + b)
 
     for (int t = 0; t < steps; ++t) {
         const T* h_t = h + t * BNH;           // Current hidden state
         T* h_next = h + (t + 1) * BNH;        // Next hidden state
+        const T* Wrx_t = tmp_Wrx + t * BNH;
         const T* Wxx_t = tmp_Wxx + t * BNH;
         T* y_t = y + t * BNH;
+        T* r_t = training ? (r_gate + t * BNH) : nullptr;
         T* pre_act_t = training ? (pre_act + t * BNH) : nullptr;
 
-        // =====================================================================
-        // Compute R @ h[t] for ALL heads in ONE batched GEMM call!
-        // =====================================================================
-        // R: [nheads, headdim, headdim], strideA = headdim*headdim
-        // h[t]: [B, nheads, headdim] -> view as nheads matrices of [headdim, B]
-        //    For head n: h[:, n, :] is [B, headdim], viewed as [headdim, B] col-major
-        //    Start: h_t + n*headdim, ldb = NH, strideB = headdim
-        // C: tmp_Rh same layout as h
+        // Step 1: Apply reset gate
+        // r = sigmoid(Wrx), h_gated = r * h
+        const int threads = 256;
+        const int blocks = (BNH + threads - 1) / threads;
 
+        if (training) {
+            ResetGateKernel<T><<<blocks, threads, 0, stream>>>(
+                BNH, Wrx_t, h_t, r_t, tmp_h_gated);
+        } else {
+            // Non-training: don't save r, use tmp buffer for r
+            ResetGateKernel<T><<<blocks, threads, 0, stream>>>(
+                BNH, Wrx_t, h_t, tmp_h_gated, tmp_h_gated);  // r written to tmp, then overwritten
+            // Actually we need a separate tmp for this case, let's just always save r
+            // For simplicity, always compute r even if not training
+            ResetGateKernel<T><<<blocks, threads, 0, stream>>>(
+                BNH, Wrx_t, h_t, tmp_Rh, tmp_h_gated);  // Use tmp_Rh as temp r storage
+        }
+
+        // Step 2: Compute R @ h_gated for ALL heads in ONE batched GEMM call
         stridedBatchedGemm(blas_handle,
             CUBLAS_OP_N, CUBLAS_OP_N,
             headdim, batch_size, headdim,  // M, N, K
             &alpha,
             R, headdim, strideW,           // A=R, lda, strideA
-            h_t, NH, strideH,              // B=h[t], ldb=NH, strideB=headdim
+            tmp_h_gated, NH, strideH,      // B=h_gated, ldb=NH, strideB=headdim
             &beta_zero,
             tmp_Rh, NH, strideH,           // C, ldc=NH, strideC=headdim
             nheads);
 
-        // Fused activation kernel: writes to BOTH y[t] and h[t+1]
-        const int threads = 256;
-        const int blocks = (BNH + threads - 1) / threads;
-
+        // Step 3: Fused activation kernel
         if (activation == 0) {
             FusedActivationKernel<T, 0><<<blocks, threads, 0, stream>>>(
                 batch_size, nheads, headdim, tmp_Rh, Wxx_t, b, y_t, pre_act_t);
@@ -349,7 +379,7 @@ void ForwardPass<T>::Run(
                 batch_size, nheads, headdim, tmp_Rh, Wxx_t, b, y_t, pre_act_t);
         }
 
-        // Copy y[t] to h[t+1] for next timestep
+        // Step 4: Copy y[t] to h[t+1] for next timestep
         cudaMemcpyAsync(h_next, y_t, BNH * sizeof(T), cudaMemcpyDeviceToDevice, stream);
     }
 }

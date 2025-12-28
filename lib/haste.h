@@ -45,3 +45,4 @@
 #include "haste/elman_lowrank_r.h"
 #include "haste/multihead_triple_r.h"
 #include "haste/diagonal_mhtr.h"
+#include "haste/elman_ladder.h"

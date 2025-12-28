@@ -55,7 +55,14 @@ CUDA_OBJS := \
 	lib/elman_neural_memory_gpu.o \
 	lib/elman_lowrank_r_gpu.o \
 	lib/multihead_triple_r_gpu.o \
-	lib/diagonal_mhtr_gpu.o
+	lib/diagonal_mhtr_gpu.o \
+	lib/stock_elman_gpu.o \
+	lib/gated_elman_gpu.o \
+	lib/selective_elman_gpu.o \
+	lib/diagonal_selective_gpu.o \
+	lib/log_storage_diagonal_gpu.o \
+	lib/log_compute_full_gpu.o \
+	lib/logspace_triple_r_gpu.o
 
 .PHONY: all haste haste_tf haste_pytorch libhaste_tf examples benchmarks clean
 

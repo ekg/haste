@@ -1,11 +1,14 @@
 # Copyright 2024 Erik Garrison. Apache 2.0 License.
-"""Multi-head Elman RNN with per-head recurrence matrices.
+"""Multi-head Elman RNN with per-head recurrence matrices and RESET GATE.
 
 Architecture per timestep per head:
-    h_new[i] = activation(R[i] @ h[i] + Wx[i] @ x[i] + b[i])
+    r[i] = sigmoid(Wr[i] @ x[i])           # Reset gate (input-only)
+    h_gated[i] = r[i] * h[i]               # Gate the history
+    h_new[i] = activation(R[i] @ h_gated[i] + Wx[i] @ x[i] + b[i])
 
 Key insight: Each head has its own headdim×headdim R matrix,
 giving 2048x more expressive recurrence than Mamba2's scalar decays.
+The reset gate enables SELECTIVE recurrence like GRU.
 """
 
 import torch
@@ -17,24 +20,26 @@ import haste_pytorch_lib as lib
 
 class MultiHeadElmanFunction(Function):
     @staticmethod
-    def forward(ctx, training, x, h0, R, Wx, bias, activation):
+    def forward(ctx, training, x, h0, R, Wr, Wx, bias, activation):
         # x: [T, B, nheads, headdim]
         # h0: [B, nheads, headdim]
         # R: [nheads, headdim, headdim] - recurrent weights per head
+        # Wr: [nheads, headdim, headdim] - reset gate weights per head
         # Wx: [nheads, headdim, headdim] - input weights per head
         # bias: [nheads, headdim]
         # activation: 0=softsign, 1=tanh_residual, 2=tanh
-        h, y, pre_act = lib.multihead_elman_forward(
+        h, y, r_gate, pre_act = lib.multihead_elman_forward(
             training,
             x.contiguous(),
             h0.contiguous(),
             R.contiguous(),
+            Wr.contiguous(),
             Wx.contiguous(),
             bias.contiguous(),
             activation
         )
         if training:
-            ctx.save_for_backward(x, R, Wx, h, pre_act)
+            ctx.save_for_backward(x, R, Wr, Wx, h, r_gate, pre_act)
             ctx.activation = activation
 
         # y is [T, B, nheads, headdim]
@@ -42,7 +47,7 @@ class MultiHeadElmanFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_h_final):
-        x, R, Wx, h, pre_act = ctx.saved_tensors
+        x, R, Wr, Wx, h, r_gate, pre_act = ctx.saved_tensors
         activation = ctx.activation
 
         T, B, nheads, headdim = grad_output.shape
@@ -54,23 +59,25 @@ class MultiHeadElmanFunction(Function):
             dy = dy.clone()
             dy[-1] = dy[-1] + grad_h_final
 
-        dx, dh0, dR, dWx, db = lib.multihead_elman_backward(
-            x, R, Wx, h, pre_act, dy, activation
+        dx, dh0, dR, dWr, dWx, db = lib.multihead_elman_backward(
+            x, R, Wr, Wx, h, r_gate, pre_act, dy, activation
         )
 
-        return None, dx, dh0, dR, dWx, db, None
+        return None, dx, dh0, dR, dWr, dWx, db, None
 
 
 class MultiHeadElman(nn.Module):
     """
-    Multi-head Elman RNN with per-head recurrence matrices.
+    Multi-head Elman RNN with per-head recurrence matrices and RESET GATE.
 
     Unlike Mamba2 which uses scalar decays per head (total: 64 parameters),
     this uses full headdim×headdim R matrices per head, giving 4096x more
     expressive recurrence (262,144 recurrence parameters per layer).
 
-    Architecture per timestep per head:
-        h_new[i] = activation(R[i] @ h[i] + Wx[i] @ x[i] + b[i])
+    The reset gate enables SELECTIVE recurrence like GRU:
+        r[i] = sigmoid(Wr[i] @ x[i])       # What to forget
+        h_gated[i] = r[i] * h[i]           # Gated history
+        h_new[i] = activation(R[i] @ h_gated[i] + Wx[i] @ x[i] + b[i])
 
     Activation options:
         0 = softsign: x / (1 + |x|) - gradient-friendly, non-saturating
@@ -94,6 +101,9 @@ class MultiHeadElman(nn.Module):
         # R: [nheads, headdim, headdim] - recurrent weights
         self.R = nn.Parameter(torch.empty(nheads, self.headdim, self.headdim))
 
+        # Wr: [nheads, headdim, headdim] - reset gate weights
+        self.Wr = nn.Parameter(torch.empty(nheads, self.headdim, self.headdim))
+
         # Wx: [nheads, headdim, headdim] - input weights
         self.Wx = nn.Parameter(torch.empty(nheads, self.headdim, self.headdim))
 
@@ -105,6 +115,7 @@ class MultiHeadElman(nn.Module):
     def _init_weights(self):
         # Xavier initialization for weights
         nn.init.xavier_uniform_(self.R)
+        nn.init.xavier_uniform_(self.Wr)
         nn.init.xavier_uniform_(self.Wx)
         nn.init.zeros_(self.bias)
 
@@ -132,7 +143,7 @@ class MultiHeadElman(nn.Module):
 
         output, h_final = MultiHeadElmanFunction.apply(
             self.training, x_heads, h0,
-            self.R, self.Wx, self.bias, self.activation
+            self.R, self.Wr, self.Wx, self.bias, self.activation
         )
 
         # Reshape output back to [T, B, D]
@@ -146,4 +157,4 @@ class MultiHeadElman(nn.Module):
     def extra_repr(self):
         return (f'input_size={self.input_size}, hidden_size={self.hidden_size}, '
                 f'nheads={self.nheads}, headdim={self.headdim}, '
-                f'activation={self.activation}')
+                f'activation={self.activation}, has_reset_gate=True')
